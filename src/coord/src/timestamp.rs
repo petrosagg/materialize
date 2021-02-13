@@ -1074,6 +1074,7 @@ impl Timestamper {
                         connector: RtTimestampConnector::S3(connector),
                     })
             }
+            ExternalSourceConnector::Postgres(_) => None,
         }
     }
 
@@ -1316,6 +1317,7 @@ impl Timestamper {
                 }
             }
             ExternalSourceConnector::S3(_) => None, // BYO is not supported for s3 sources
+            ExternalSourceConnector::Postgres(_) => None, // BYO is not supported for s3 sources
         }
     }
 

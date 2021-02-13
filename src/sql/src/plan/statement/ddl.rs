@@ -25,9 +25,9 @@ use reqwest::Url;
 use dataflow_types::{
     AvroEncoding, AvroOcfEncoding, AvroOcfSinkConnectorBuilder, Compression, Consistency,
     CsvEncoding, DataEncoding, ExternalSourceConnector, FileSourceConnector,
-    KafkaSinkConnectorBuilder, KafkaSourceConnector, KinesisSourceConnector, ProtobufEncoding,
-    RegexEncoding, S3SourceConnector, SinkConnectorBuilder, SinkEnvelope, SourceConnector,
-    SourceEnvelope,
+    KafkaSinkConnectorBuilder, KafkaSourceConnector, KinesisSourceConnector,
+    PostgresSourceConnector, ProtobufEncoding, RegexEncoding, S3SourceConnector,
+    SinkConnectorBuilder, SinkEnvelope, SourceConnector, SourceEnvelope,
 };
 use expr::GlobalId;
 use interchange::avro::{self, DebeziumDeduplicationStrategy, Encoder};
@@ -317,6 +317,7 @@ pub fn plan_create_source(
             }
             Format::Json => unsupported!("JSON sources"),
             Format::Text => DataEncoding::Text,
+            Format::Postgres(desc) => DataEncoding::Postgres(serde_json::from_str(desc).unwrap()),
         })
     };
 
@@ -432,6 +433,19 @@ pub fn plan_create_source(
                 path: path.clone().into(),
                 compression: compression.clone().into(),
                 tail,
+            });
+            let encoding = get_encoding(format)?;
+            (connector, encoding)
+        }
+        Connector::Postgres {
+            conn,
+            publication,
+            table,
+        } => {
+            let connector = ExternalSourceConnector::Postgres(PostgresSourceConnector {
+                conn: conn.clone().into(),
+                publication: publication.clone().into(),
+                table: table.clone().into(),
             });
             let encoding = get_encoding(format)?;
             (connector, encoding)
@@ -919,6 +933,7 @@ pub fn plan_create_sink(
         Connector::Kinesis { .. } => None,
         Connector::AvroOcf { .. } => None,
         Connector::S3 { .. } => None,
+        Connector::Postgres { .. } => None,
     };
 
     let key_desc_and_indices = key_indices.map(|key_indices| {
@@ -952,6 +967,7 @@ pub fn plan_create_sink(
         Connector::Kinesis { .. } => unsupported!("Kinesis sinks"),
         Connector::AvroOcf { path } => avro_ocf_sink_builder(format, path, suffix, value_desc)?,
         Connector::S3 { .. } => unsupported!("S3 sinks"),
+        Connector::Postgres { .. } => unsupported!("Postgres sinks"),
     };
 
     if !with_options.is_empty() {

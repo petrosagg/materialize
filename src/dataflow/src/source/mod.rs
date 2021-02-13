@@ -9,6 +9,7 @@
 
 //! Types related to the creation of dataflow sources.
 
+use futures::stream::{BoxStream, StreamExt as _};
 use mz_avro::types::Value;
 use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
@@ -19,7 +20,7 @@ use std::rc::Rc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use timely::dataflow::{
     channels::pact::{Exchange, ParallelizationContract},
-    operators::Capability,
+    operators::{self, Capability, Event, ToStreamAsync},
 };
 
 use dataflow_types::{Consistency, DataEncoding, ExternalSourceConnector, MzOffset, SourceError};
@@ -32,7 +33,7 @@ use prometheus::{
     register_uint_gauge_vec, DeleteOnDropCounter, DeleteOnDropGauge, IntCounter, IntCounterVec,
     IntGaugeVec, UIntGauge, UIntGaugeVec,
 };
-use repr::Timestamp;
+use repr::{Diff, Row, Timestamp};
 use timely::dataflow::Scope;
 use timely::scheduling::activate::{Activator, SyncActivator};
 use timely::Data;
@@ -48,6 +49,7 @@ use crate::source::cache::CacheSender;
 mod file;
 mod kafka;
 mod kinesis;
+mod postgres;
 mod s3;
 mod util;
 
@@ -59,6 +61,7 @@ pub use file::FileReadStyle;
 pub use file::FileSourceInfo;
 pub use kafka::KafkaSourceInfo;
 pub use kinesis::KinesisSourceInfo;
+pub use postgres::PostgresSimpleSource;
 pub use s3::S3SourceInfo;
 
 /// Shared configuration information for all source types.
@@ -847,6 +850,129 @@ enum MessageProcessing {
     Active,
     Yielded,
     YieldedWithDelay,
+}
+
+/*
+// A clock that ticks at regular intervals unless someone is holding a lease 
+struct ClockStream {
+    lease: Arc<Timestamp>,
+    interval: tokio::time::Interval,
+}
+
+impl ClockStream {
+    fn new(interval: Duration) -> Self {
+        Self {
+            lease: Arc::new(UNIX_EPOCH.elapsed().as_millis()),
+            interval: tokio::time::interval(duration),
+        }
+    }
+
+    fn lease(&self) -> Arc<Timestamp> {
+        self.lease.clone()
+    }
+}
+
+impl Stream for ClockStream {
+    type Item = Timestamp;
+
+    pub fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        match self.interval.poll_tick(cx) {
+            Poll::Ready(_) => {
+                match this.time.get_mut() {
+                    // No-lease is active, tick monotonically
+                    Some(t) => {
+                        *t = std::cmp::max(t, UNIX_EPOCH.elapsed().as_millis());
+                        Poll::Ready(Some(*t))
+                    },
+                    // A lease is active, we'll skip this tick
+                    None => Poll::Pending,
+                }
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+*/
+
+/// foobar
+pub type StreamItem = Event<Option<Timestamp>, Result<(Row, Diff), String>>;
+
+/// The model of a simple source is one that provides a stream of streams
+/// The inner streams represent atomic units of change (e.g a transaction) and are guaranteed to be
+/// timestamped at exactly the same time. The system will wait until an inner stream is done before
+/// closing the timestamp
+pub trait SimpleSource {
+    /// foobar
+    fn build_stream<'a>(&mut self) -> BoxStream<'a, StreamItem>;
+}
+
+/// Creates a source dataflow operator. The type of ExternalSourceConnector determines the
+/// type of source that should be created
+pub(crate) fn create_source_simple<G, C>(
+    config: SourceConfig<G>,
+    mut connector: C,
+) -> (
+    (
+        timely::dataflow::Stream<G, (Row, Timestamp, Diff)>,
+        timely::dataflow::Stream<G, SourceError>,
+    ),
+    Option<SourceToken>,
+)
+where
+    G: Scope<Timestamp = Timestamp>,
+    C: SimpleSource + 'static,
+{
+    let SourceConfig {
+
+        scope,
+        active,
+        timestamp_frequency,
+        ..
+    } = config;
+
+    if active {
+        // let monotonic_clock = MonotonicClock::new();
+
+        // let tx_stream = connector.tx_stream();
+        // // Generates empty transactions every `timestamp_frequency` milliseconds
+        // let ticks = time::interval(timestamp_frequency).map(|_| empty());
+
+        // let (future, stream) = select(tx_stream, ticks)
+        //     .map(|tx| 
+        //          let tx_time = monotonic_clock.next();
+
+        //          tx.map(|item| {
+        //              let time = tx_time.clone();
+        //              match item {
+        //                  Ok((row, diff)) => Event::Message(time, Ok((row, time, diff))),
+        //                  Err(err) => Event::Message(time, Err(err)),
+        //             }
+        //          })
+        //          .chain(Some(Event::Progress(Some(tx_time))));
+        //     )
+        //     .flatten()
+        //     .boxed()
+        //     .to_stream(scope);
+
+        let stream = connector.build_stream();
+        let (future, stream) = stream.map(|item| {
+            match item {
+                Event::Message(time, Ok((row, diff))) => Event::Message(time, Ok((row, time, diff))),
+                Event::Message(time, Err(err)) => Event::Message(time, Err(err)),
+                Event::Progress(p) => Event::Progress(p),
+            }
+        }).boxed().to_stream(scope);
+
+        tokio::spawn(future);
+
+        let (ok_stream, err_stream) = stream.map_fallible(|r| r.map_err(SourceError::FileIO));
+
+        ((ok_stream, err_stream), None)
+    } else {
+        let ok_stream = operators::generic::operator::empty(scope);
+        let err_stream = operators::generic::operator::empty(scope);
+        ((ok_stream, err_stream), None)
+    }
 }
 
 /// Creates a source dataflow operator. The type of ExternalSourceConnector determines the

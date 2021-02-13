@@ -126,6 +126,7 @@ pub enum Format {
     },
     Json,
     Text,
+    Postgres(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -209,6 +210,7 @@ impl AstDisplay for Format {
             }
             Self::Json => f.write_str("JSON"),
             Self::Text => f.write_str("TEXT"),
+            Self::Postgres(_) => f.write_str("POSTGRES"),
         }
     }
 }
@@ -268,6 +270,14 @@ pub enum Connector {
         /// The argument to the MATCHING clause: `MATCHING 'a/**/*.json'`
         pattern: Option<String>,
     },
+    Postgres {
+        /// The postgres connection string
+        conn: String,
+        /// The name of the publication to sync
+        publication: String,
+        /// The name of the table to sync
+        table: String,
+    },
 }
 
 impl AstDisplay for Connector {
@@ -314,6 +324,19 @@ impl AstDisplay for Connector {
                     f.write_str(&display::escape_single_quote_string(pattern));
                     f.write_str("'");
                 }
+            }
+            Connector::Postgres {
+                conn,
+                publication,
+                table,
+            } => {
+                f.write_str("POSTGRES '");
+                f.write_str(&display::escape_single_quote_string(conn));
+                f.write_str("' PUBLICATION '");
+                f.write_str(&display::escape_single_quote_string(publication));
+                f.write_str("' TABLE '");
+                f.write_str(&display::escape_single_quote_string(table));
+                f.write_str("'");
             }
         }
     }

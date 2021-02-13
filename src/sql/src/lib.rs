@@ -29,6 +29,7 @@ macro_rules! unsupported {
 }
 
 mod kafka_util;
+mod postgres_util;
 
 pub mod ast;
 pub mod catalog;

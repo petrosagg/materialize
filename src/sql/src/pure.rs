@@ -21,6 +21,7 @@ use sql_parser::ast::{
 
 use crate::kafka_util;
 use crate::normalize;
+use crate::postgres_util;
 
 /// Removes dependencies on external state from `stmt`: inlining schemas in
 /// files, fetching schemas from registries, and so on. The [`Statement`]
@@ -71,6 +72,15 @@ pub async fn purify(mut stmt: Statement<Raw>) -> Result<Statement<Raw>, anyhow::
                     bail!("Expected a regular file, but {} is a directory.", path);
                 }
                 file = Some(f);
+            }
+            Connector::Postgres {
+                conn,
+                publication,
+                table,
+            } => {
+                let relation_desc =
+                    postgres_util::get_remote_postgres_schema(conn, publication, table).await?;
+                *format = Some(Format::Postgres(serde_json::to_string(&relation_desc)?));
             }
             _ => (),
         }

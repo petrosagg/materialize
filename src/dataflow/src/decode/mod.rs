@@ -598,5 +598,8 @@ where
             ),
             None,
         ),
+        (DataEncoding::Postgres(_), SourceEnvelope::None) => {
+            todo!();
+        }
     }
 }

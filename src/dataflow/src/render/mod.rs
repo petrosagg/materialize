@@ -121,7 +121,9 @@ use timely::dataflow::Scope;
 use timely::worker::Worker as TimelyWorker;
 
 use dataflow_types::*;
-use expr::{GlobalId, Id, MapFilterProject, MirRelationExpr, MirScalarExpr, SourceInstanceId};
+use expr::{
+    GlobalId, Id, MapFilterProject, MirRelationExpr, MirScalarExpr, SourceInstanceId,
+};
 use interchange::envelopes::{combine_at_timestamp, dbz_format, upsert_format};
 use mz_avro::types::Value;
 use mz_avro::Schema;
@@ -136,7 +138,9 @@ use crate::operator::{CollectionExt, StreamExt};
 use crate::render::context::{ArrangementFlavor, Context};
 use crate::server::{CacheMessage, LocalInput, TimestampDataUpdates, TimestampMetadataUpdates};
 use crate::sink;
-use crate::source::{self, FileSourceInfo, KafkaSourceInfo, KinesisSourceInfo, S3SourceInfo};
+use crate::source::{
+    self, FileSourceInfo, KafkaSourceInfo, KinesisSourceInfo, PostgresSimpleSource, S3SourceInfo,
+};
 use crate::source::{SourceConfig, SourceToken};
 use crate::{
     arrangement::manager::{TraceBundle, TraceManager},
@@ -400,6 +404,20 @@ where
                             decode_avro_values(&source, &envelope, reader_schema, &self.debug_name),
                             capability,
                         )
+                    } else if let ExternalSourceConnector::Postgres(pg_connector) = connector {
+                        let source = PostgresSimpleSource::new(pg_connector);
+
+                        let ((ok_stream, err_stream), capability) =
+                            source::create_source_simple(source_config, source);
+
+                        err_collection = err_collection.concat(
+                            &err_stream
+                                .map(DataflowError::SourceError)
+                                .pass_through("source-errors")
+                                .as_collection(),
+                        );
+
+                        (ok_stream, capability)
                     } else {
                         let ((ok_source, err_source), capability) = match connector {
                             ExternalSourceConnector::Kafka(_) => {
@@ -426,7 +444,8 @@ where
                                     connector,
                                 )
                             }
-                            ExternalSourceConnector::AvroOcf(_) => unreachable!(),
+                            ExternalSourceConnector::AvroOcf(_)
+                            | ExternalSourceConnector::Postgres(_) => unreachable!(),
                         };
                         err_collection = err_collection.concat(
                             &err_source

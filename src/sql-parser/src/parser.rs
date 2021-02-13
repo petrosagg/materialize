@@ -1616,7 +1616,19 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_connector(&mut self) -> Result<Connector, ParserError> {
-        match self.expect_one_of_keywords(&[FILE, KAFKA, KINESIS, AVRO, S3])? {
+        match self.expect_one_of_keywords(&[FILE, KAFKA, KINESIS, AVRO, S3, POSTGRES])? {
+            POSTGRES => {
+                let conn = self.parse_literal_string()?;
+                self.expect_keyword(PUBLICATION)?;
+                let publication = self.parse_literal_string()?;
+                self.expect_keyword(TABLE)?;
+                let table = self.parse_literal_string()?;
+                Ok(Connector::Postgres {
+                    conn,
+                    publication,
+                    table,
+                })
+            }
             FILE => {
                 let path = self.parse_literal_string()?;
                 let compression = if self.parse_keyword(COMPRESSION) {
