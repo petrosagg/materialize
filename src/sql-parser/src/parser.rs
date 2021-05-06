@@ -116,6 +116,13 @@ impl fmt::Display for ParserError {
 
 impl Error for ParserError {}
 
+struct ViewDef {
+    name: UnresolvedObjectName,
+    columns: Vec<Ident>,
+    with_options: Vec<SqlOption<Raw>>,
+    query: Query<Raw>,
+}
+
 impl ParserError {
     /// Constructs an error with the provided message at the provided position.
     pub(crate) fn new<S>(pos: usize, message: S) -> ParserError
@@ -1416,10 +1423,13 @@ impl<'a> Parser<'a> {
             if self.parse_keyword(VIEW) {
                 self.index = index;
                 self.parse_create_view()
+            } else if self.parse_keyword(VIEWS) {
+                self.index = index;
+                self.parse_create_views()
             } else {
                 self.expected(
                     self.peek_pos(),
-                    "DATABASE, SCHEMA, ROLE, USER, TYPE, INDEX, SINK, SOURCE, TABLE or [OR REPLACE] [TEMPORARY] [MATERIALIZED] VIEW after CREATE",
+                    "DATABASE, SCHEMA, ROLE, USER, TYPE, INDEX, SINK, SOURCE, TABLE or [OR REPLACE] [TEMPORARY] [MATERIALIZED] VIEW or VIEWS after CREATE",
                     self.peek_token(),
                 )
             }
@@ -1858,6 +1868,19 @@ impl<'a> Parser<'a> {
             if_exists = IfExistsBehavior::Skip;
         }
 
+        let view_def = self.parse_view_definition()?;
+        Ok(Statement::CreateView(CreateViewStatement {
+            name: view_def.name,
+            columns: view_def.columns,
+            query: view_def.query,
+            with_options: view_def.with_options,
+            temporary,
+            materialized,
+            if_exists,
+        }))
+    }
+
+    fn parse_view_definition(&mut self) -> Result<ViewDef, ParserError> {
         // Many dialects support `OR REPLACE` | `OR ALTER` right after `CREATE`, but we don't (yet).
         // ANSI SQL and Postgres support RECURSIVE here, but we don't support it either.
         let name = self.parse_object_name()?;
@@ -1866,14 +1889,65 @@ impl<'a> Parser<'a> {
         self.expect_keyword(AS)?;
         let query = self.parse_query()?;
         // Optional `WITH [ CASCADED | LOCAL ] CHECK OPTION` is widely supported here.
-        Ok(Statement::CreateView(CreateViewStatement {
-            name,
-            columns,
-            query,
+        Ok(ViewDef { name, columns, with_options, query })
+    }
+
+    fn parse_create_views(&mut self) -> Result<Statement<Raw>, ParserError> {
+        let mut if_exists = if self.parse_keyword(OR) {
+            self.expect_keyword(REPLACE)?;
+            IfExistsBehavior::Replace
+        } else {
+            IfExistsBehavior::Error
+        };
+        let temporary = self.parse_keyword(TEMPORARY) | self.parse_keyword(TEMP);
+        let materialized = self.parse_keyword(MATERIALIZED);
+        self.expect_keyword(VIEWS)?;
+        if if_exists == IfExistsBehavior::Error && self.parse_if_not_exists()? {
+            if_exists = IfExistsBehavior::Skip;
+        }
+
+        let views_definition = if self.parse_keywords(&[FROM, SOURCE]) {
+            let name = self.parse_object_name()?;
+            let targets = if self.consume_token(&Token::LParen) {
+                let targets = self.parse_comma_separated(|parser| {
+                    let name = parser.parse_identifier()?;
+                    let alias = if parser.parse_keyword(AS) {
+                        Some(parser.parse_identifier()?)
+                    } else {
+                        None
+                    };
+                    Ok(CreateViewsSourceTarget { name, alias })
+                })?;
+                self.expect_token(&Token::RParen)?;
+                Some(targets)
+            } else {
+                None
+            };
+            CreateViewsDefinition::Source { name, targets }
+        } else {
+            let views = self.parse_comma_separated(|parser| {
+                parser.expect_token(&Token::LParen)?;
+                let view_def = parser.parse_view_definition()?;
+                parser.expect_token(&Token::RParen)?;
+                Ok(CreateViewStatement {
+                    name: view_def.name,
+                    columns: view_def.columns,
+                    query: view_def.query,
+                    with_options: view_def.with_options,
+                    temporary,
+                    materialized,
+                    if_exists,
+                })
+            })?;
+
+            CreateViewsDefinition::Literal(views)
+        };
+
+        Ok(Statement::CreateViews(CreateViewsStatement {
             temporary,
             materialized,
             if_exists,
-            with_options,
+            views_definition,
         }))
     }
 
