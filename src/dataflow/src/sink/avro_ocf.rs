@@ -7,20 +7,20 @@
 // the Business Source License, use of this software will be governed
 // by the Apache License, Version 2.0.
 
-use std::fs::OpenOptions;
+use std::fs::{File, OpenOptions};
 
-use differential_dataflow::Collection;
+use differential_dataflow::{Collection, Hashable};
 
 use itertools::repeat_n;
 use log::error;
-use timely::dataflow::channels::pact::Pipeline;
+use timely::dataflow::channels::pact::Exchange;
 use timely::dataflow::operators::generic::Operator;
 use timely::dataflow::Scope;
 
 use dataflow_types::AvroOcfSinkConnector;
 use expr::GlobalId;
 use interchange::avro::{encode_datums_as_avro, Encoder};
-use mz_avro::{self};
+use mz_avro::{self, Writer};
 use repr::{RelationDesc, Row, Timestamp};
 
 pub fn avro_ocf<G>(
@@ -43,26 +43,39 @@ pub fn avro_ocf<G>(
         (schema, columns)
     };
 
-    let res = OpenOptions::new().append(true).open(&connector.path);
-    let mut avro_writer = match res {
-        Ok(f) => Some(mz_avro::Writer::new(schema, f)),
-        Err(e) => {
-            error!("creating avro ocf file writer for sink failed: {}", e);
-            None
+    let create_avro_writer = move || {
+        let res = OpenOptions::new().append(true).open(&connector.path);
+        match res {
+            Ok(f) => Ok(mz_avro::Writer::new(schema.clone(), f)),
+            Err(e) => Err(format!(
+                "creating avro ocf file writer for sink failed: {}",
+                e
+            )),
         }
     };
 
     let mut vector = vec![];
+    let mut avro_writer: Option<Result<Writer<File>, _>> = None;
 
-    collection
-        .inner
-        .sink(Pipeline, &format!("avro-ocf-{}", id), move |input| {
-            let avro_writer = match avro_writer.as_mut() {
-                Some(avro_writer) => avro_writer,
-                None => return,
-            };
+    // We want exactly one worker to write to the single output file
+    let hashed_id = id.hashed();
+
+    collection.inner.sink(
+        Exchange::new(move |_| hashed_id),
+        &format!("avro-ocf-{}", id),
+        move |input| {
             input.for_each(|_, rows| {
                 rows.swap(&mut vector);
+
+                let avro_writer = avro_writer.get_or_insert_with(|| create_avro_writer());
+
+                let avro_writer = match avro_writer.as_mut() {
+                    Ok(avro_writer) => avro_writer,
+                    Err(e) => {
+                        error!("{}", e);
+                        return;
+                    }
+                };
 
                 for (v, _time, diff) in vector.drain(..) {
                     let value = encode_datums_as_avro(v.iter(), &columns);
@@ -79,5 +92,6 @@ pub fn avro_ocf<G>(
                     Err(e) => error!("flushing bytes to avro ocf failed: {}", e),
                 }
             })
-        })
+        },
+    )
 }
