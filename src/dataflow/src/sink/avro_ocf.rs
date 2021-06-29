@@ -7,7 +7,7 @@
 // the Business Source License, use of this software will be governed
 // by the Apache License, Version 2.0.
 
-use std::fs::{File, OpenOptions};
+use std::fs::OpenOptions;
 
 use differential_dataflow::{Collection, Hashable};
 
@@ -20,7 +20,6 @@ use timely::dataflow::Scope;
 use dataflow_types::AvroOcfSinkConnector;
 use expr::GlobalId;
 use interchange::avro::{encode_datums_as_avro, Encoder};
-use mz_avro::{self, Writer};
 use repr::{RelationDesc, Row, Timestamp};
 
 pub fn avro_ocf<G>(
@@ -43,19 +42,8 @@ pub fn avro_ocf<G>(
         (schema, columns)
     };
 
-    let create_avro_writer = move || {
-        let res = OpenOptions::new().append(true).open(&connector.path);
-        match res {
-            Ok(f) => Ok(mz_avro::Writer::new(schema.clone(), f)),
-            Err(e) => Err(format!(
-                "creating avro ocf file writer for sink failed: {}",
-                e
-            )),
-        }
-    };
-
     let mut vector = vec![];
-    let mut avro_writer: Option<Result<Writer<File>, _>> = None;
+    let mut avro_writer = None;
 
     // We want exactly one worker to write to the single output file
     let hashed_id = id.hashed();
@@ -67,29 +55,37 @@ pub fn avro_ocf<G>(
             input.for_each(|_, rows| {
                 rows.swap(&mut vector);
 
-                let avro_writer = avro_writer.get_or_insert_with(|| create_avro_writer());
+                let mut fallible = || -> Result<(), String> {
+                    let avro_writer = match avro_writer.as_mut() {
+                        Some(v) => v,
+                        None => {
+                            let file = OpenOptions::new()
+                                .append(true)
+                                .open(&connector.path)
+                                .map_err(|e| {
+                                    format!("creating avro ocf file writer for sink failed: {}", e)
+                                })?;
+                            avro_writer.get_or_insert(mz_avro::Writer::new(schema.clone(), file))
+                        }
+                    };
 
-                let avro_writer = match avro_writer.as_mut() {
-                    Ok(avro_writer) => avro_writer,
-                    Err(e) => {
-                        error!("{}", e);
-                        return;
+                    for (v, _time, diff) in vector.drain(..) {
+                        let value = encode_datums_as_avro(v.iter(), &columns);
+                        assert!(diff > 0, "can't sink negative multiplicities");
+                        for value in repeat_n(value, diff as usize) {
+                            avro_writer
+                                .append(value)
+                                .map_err(|e| format!("appending to avro ocf failed: {}", e))?;
+                        }
                     }
+                    avro_writer
+                        .flush()
+                        .map_err(|e| format!("flushing bytes to avro ocf failed: {}", e))?;
+                    Ok(())
                 };
 
-                for (v, _time, diff) in vector.drain(..) {
-                    let value = encode_datums_as_avro(v.iter(), &columns);
-                    assert!(diff > 0, "can't sink negative multiplicities");
-                    for value in repeat_n(value, diff as usize) {
-                        if let Err(e) = avro_writer.append(value) {
-                            error!("appending to avro ocf failed: {}", e)
-                        };
-                    }
-                }
-                let res = avro_writer.flush();
-                match res {
-                    Ok(_) => (),
-                    Err(e) => error!("flushing bytes to avro ocf failed: {}", e),
+                if let Err(e) = fallible() {
+                    error!("{}", e);
                 }
             })
         },
