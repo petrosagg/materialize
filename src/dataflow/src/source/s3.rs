@@ -224,7 +224,7 @@ async fn download_objects_task(
                                     msg_ref.key,
                                     state.i
                                 );
-                                Err((DownloadStatus::Fail(e), update))
+                                Err((DownloadStatus::Retry(e), update))
                             }
                         }
                     })
@@ -775,7 +775,7 @@ async fn download_object(
             length.try_into().unwrap_or(CHUNK_SIZE)
         } else {
             log::debug!(
-                "source_id={} surprisingly got not content_length for {}/{}",
+                "source_id={} surprisingly got no content_length for {}/{}",
                 source_id,
                 bucket,
                 key
