@@ -768,26 +768,19 @@ async fn download_object(
 
     if let Some(body) = obj.body {
         // sending EOF after empty objects causes empty records in dataflow
-        let length = if let Some(length) = obj.content_length {
+        if let Some(length) = obj.content_length {
             if length == 0 {
                 return (DownloadStatus::Empty, None);
             }
-            length.try_into().unwrap_or(CHUNK_SIZE)
-        } else {
-            log::debug!(
-                "source_id={} surprisingly got no content_length for {}/{}",
-                source_id,
-                bucket,
-                key
-            );
-            CHUNK_SIZE
         };
         let mut reader = BufReader::new(body.into_async_read());
         let (mut download_status, metric_update) = match compression {
-            Compression::None => read_object_chunked(source_id, length, &mut reader, tx).await,
+            Compression::None => {
+                read_object_chunked(source_id, obj.content_length, &mut reader, tx).await
+            }
             Compression::Gzip => {
                 let mut decoder = GzipDecoder::new(reader);
-                read_object_chunked(source_id, length, &mut decoder, tx).await
+                read_object_chunked(source_id, obj.content_length, &mut decoder, tx).await
             }
         };
 
@@ -819,17 +812,23 @@ async fn download_object(
 
 async fn read_object_chunked<R>(
     source_id: &str,
-    object_size: usize,
+    object_length: Option<i64>,
     reader: &mut R,
     tx: &Sender<Result<InternalMessage, S3Error>>,
 ) -> (DownloadStatus, Option<DownloadMetricUpdate>)
 where
     R: Unpin + AsyncRead,
 {
+    let chunk_size = cmp::min(
+        CHUNK_SIZE,
+        object_length
+            .map(|l| l.try_into().expect("object_length should fit in usize"))
+            .unwrap_or(CHUNK_SIZE),
+    );
     let mut bytes = 0;
     let mut chunks = 0;
     loop {
-        let mut chunk = vec![0; cmp::min(CHUNK_SIZE, object_size)];
+        let mut chunk = vec![0; chunk_size];
 
         let read_bytes = match reader.read(&mut chunk).await {
             Ok(read_bytes) => read_bytes,
