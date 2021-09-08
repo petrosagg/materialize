@@ -27,7 +27,6 @@
 //!        .  .  .  .
 //! ```
 
-use std::cmp;
 use std::collections::{HashMap, HashSet};
 use std::convert::{From, TryInto};
 use std::default::Default;
@@ -36,7 +35,7 @@ use std::ops::AddAssign;
 
 use anyhow::anyhow;
 use async_compression::tokio::bufread::GzipDecoder;
-use futures::FutureExt;
+use futures::{FutureExt, TryFutureExt, TryStreamExt};
 use globset::GlobMatcher;
 use rusoto_core::RusotoError;
 use rusoto_s3::{GetObjectRequest, ListObjectsV2Request, S3Client, S3};
@@ -45,9 +44,10 @@ use rusoto_sqs::{
     DeleteMessageRequest, GetQueueUrlRequest, ReceiveMessageRequest, Sqs,
 };
 use timely::scheduling::SyncActivator;
-use tokio::io::{AsyncRead, AsyncReadExt, BufReader};
+use tokio::io::{AsyncRead, BufReader};
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::time::{self, Duration};
+use tokio_util::io::ReaderStream;
 
 use aws_util::aws;
 use dataflow_types::{
@@ -775,12 +775,10 @@ async fn download_object(
         };
         let mut reader = BufReader::new(body.into_async_read());
         let (mut download_status, metric_update) = match compression {
-            Compression::None => {
-                read_object_chunked(source_id, obj.content_length, &mut reader, tx).await
-            }
+            Compression::None => read_object_chunked(source_id, &mut reader, tx).await,
             Compression::Gzip => {
                 let mut decoder = GzipDecoder::new(reader);
-                read_object_chunked(source_id, obj.content_length, &mut decoder, tx).await
+                read_object_chunked(source_id, &mut decoder, tx).await
             }
         };
 
@@ -812,61 +810,41 @@ async fn download_object(
 
 async fn read_object_chunked<R>(
     source_id: &str,
-    object_length: Option<i64>,
     reader: &mut R,
     tx: &Sender<Result<InternalMessage, S3Error>>,
 ) -> (DownloadStatus, Option<DownloadMetricUpdate>)
 where
     R: Unpin + AsyncRead,
 {
-    let chunk_size = cmp::min(
-        CHUNK_SIZE,
-        object_length
-            .map(|l| l.try_into().expect("object_length should fit in usize"))
-            .unwrap_or(CHUNK_SIZE),
-    );
-    let mut bytes = 0;
-    let mut chunks = 0;
-    loop {
-        let mut chunk = vec![0; chunk_size];
+    let res = ReaderStream::with_capacity(reader, CHUNK_SIZE)
+        .map_err(|err| DownloadStatus::Fail(S3Error::Read(err)))
+        .try_fold((0, 0), |(bytes, chunks), chunk| async move {
+            tx.send(Ok(InternalMessage {
+                record: MessagePayload::Data(chunk.to_vec()),
+            }))
+            .map_err(|_| DownloadStatus::SendFailed)
+            .await?;
+            Ok((bytes + chunk.len(), chunks + 1))
+        })
+        .await;
 
-        let read_bytes = match reader.read(&mut chunk).await {
-            Ok(read_bytes) => read_bytes,
-            Err(err) => {
-                return (DownloadStatus::Fail(S3Error::Read(err)), None);
-            }
-        };
-
-        bytes += read_bytes;
-
-        if read_bytes > 0 {
-            chunks += 1;
-            chunk.truncate(read_bytes);
-            chunk.shrink_to_fit();
-            if tx
-                .send(Ok(InternalMessage {
-                    record: MessagePayload::Data(chunk),
-                }))
-                .await
-                .is_err()
-            {
-                return (DownloadStatus::SendFailed, None);
-            }
-        } else {
+    match res {
+        Ok((bytes, chunks)) => {
             log::trace!(
                 "source_id={} finished sending object to dataflow chunks={} bytes={}",
                 source_id,
                 chunks,
                 bytes
             );
-            return (
+            (
                 DownloadStatus::Ok,
                 Some(DownloadMetricUpdate {
                     bytes: bytes.try_into().expect("usize <= u64"),
                     messages: chunks,
                 }),
-            );
+            )
         }
+        Err(err) => (err, None),
     }
 }
 
