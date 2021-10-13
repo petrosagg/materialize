@@ -32,7 +32,7 @@ use crate::{Row, RowArena};
 ///
 /// Note that `Datum` must always derive [`Eq`] to enforce equality with
 /// `repr::Row`.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Ord, PartialOrd)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Ord, PartialOrd, Serialize, Deserialize)]
 pub enum Datum<'a> {
     /// The `false` boolean value.
     False,
@@ -53,8 +53,10 @@ pub enum Datum<'a> {
     /// A time.
     Time(NaiveTime),
     /// A date and time, without a timezone.
+    #[serde(with = "chrono::naive::serde::ts_nanoseconds")]
     Timestamp(NaiveDateTime),
     /// A date and time, with a timezone.
+    #[serde(with = "chrono::serde::ts_nanoseconds")]
     TimestampTz(DateTime<Utc>),
     /// A span of time.
     Interval(Interval),
@@ -80,6 +82,7 @@ pub enum Datum<'a> {
     /// distinct from a non-null datum that contains the JSON value `null`.
     JsonNull,
     /// A universally unique identifier.
+    #[serde(with = "uuid::adapter::compact")]
     Uuid(Uuid),
     /// A placeholder value.
     ///

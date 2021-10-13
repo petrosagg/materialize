@@ -10,22 +10,14 @@
 use std::borrow::Borrow;
 use std::cell::RefCell;
 use std::cmp::Ordering;
-use std::convert::{TryFrom, TryInto};
+use std::convert::TryInto;
 use std::fmt;
 use std::mem::{size_of, transmute};
 
-use chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, Utc};
-use ordered_float::OrderedFloat;
 use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
-use uuid::Uuid;
 
-use crate::adt::array::{
-    Array, ArrayDimension, ArrayDimensions, InvalidArrayError, MAX_ARRAY_DIMENSIONS,
-};
-use crate::adt::interval::Interval;
-use crate::adt::numeric;
-use crate::adt::numeric::Numeric;
+use crate::adt::array::{ArrayDimension, InvalidArrayError, MAX_ARRAY_DIMENSIONS};
 use crate::Datum;
 use fmt::Debug;
 
@@ -139,16 +131,12 @@ pub struct RowRef<'a> {
     data: &'a [u8],
 }
 
-#[derive(Debug)]
 pub struct DatumListIter<'a> {
-    data: &'a [u8],
-    offset: usize,
+    deser: bincode::de::Deserializer<bincode::de::read::SliceReader<'a>, bincode::config::DefaultOptions>,
 }
 
-#[derive(Debug)]
 pub struct DatumDictIter<'a> {
-    data: &'a [u8],
-    offset: usize,
+    deser: bincode::de::Deserializer<bincode::de::read::SliceReader<'a>, bincode::config::DefaultOptions>,
     prev_key: Option<&'a str>,
 }
 
@@ -167,7 +155,7 @@ pub struct RowArena {
 // DatumList and DatumDict defined here rather than near Datum because we need private access to the unsafe data field
 
 /// A sequence of Datums
-#[derive(Clone, Copy, Eq, PartialEq, Hash)]
+#[derive(Clone, Copy, Eq, PartialEq, Hash, Serialize, Deserialize)]
 pub struct DatumList<'a> {
     /// Points at the serialized datums
     data: &'a [u8],
@@ -192,7 +180,7 @@ impl PartialOrd for DatumList<'_> {
 }
 
 /// A mapping from string keys to Datums
-#[derive(Clone, Copy, Eq, PartialEq, Hash, Ord, PartialOrd)]
+#[derive(Clone, Copy, Eq, PartialEq, Hash, Ord, PartialOrd, Serialize, Deserialize)]
 pub struct DatumMap<'a> {
     /// Points at the serialized datums, which should be sorted in key order
     data: &'a [u8],
@@ -233,173 +221,6 @@ enum Tag {
 // --------------------------------------------------------------------------------
 // reading data
 
-/// Reads a `Copy` value starting at byte `offset`.
-///
-/// Updates `offset` to point to the first byte after the end of the read region.
-///
-/// # Safety
-///
-/// This function is safe if a value of type `T` was previously written at this offset by `push_copy!`.
-/// Otherwise it could return invalid values, which is Undefined Behavior.
-#[inline(always)]
-unsafe fn read_copy<T>(data: &[u8], offset: &mut usize) -> T
-where
-    T: Copy,
-{
-    debug_assert!(data.len() >= *offset + size_of::<T>());
-    let ptr = data.as_ptr().add(*offset);
-    *offset += size_of::<T>();
-    (ptr as *const T).read_unaligned()
-}
-
-/// Read a byte slice starting at byte `offset`.
-///
-/// Updates `offset` to point to the first byte after the end of the read region.
-///
-/// # Safety
-///
-/// This function is safe if a `&[u8]` was previously written at this offset by `push_untagged_bytes`.
-/// Otherwise it could return invalid values, which is Undefined Behavior.
-unsafe fn read_untagged_bytes<'a>(data: &'a [u8], offset: &mut usize) -> &'a [u8] {
-    let len = read_copy::<usize>(data, offset);
-    let bytes = &data[*offset..(*offset + len)];
-    *offset += len;
-    bytes
-}
-
-/// Read a data whose length is encoded in the row before its contents.
-///
-/// Updates `offset` to point to the first byte after the end of the read region.
-///
-/// # Safety
-///
-/// This function is safe if the datum's length and contents were previously written by `push_lengthed_bytes`,
-/// and it was only written with a `String` tag if it was indeed UTF-8.
-unsafe fn read_lengthed_datum<'a>(data: &'a [u8], offset: &mut usize, tag: Tag) -> Datum<'a> {
-    let len = match tag {
-        Tag::BytesTiny | Tag::StringTiny => read_copy::<u8>(data, offset) as usize,
-        Tag::BytesShort | Tag::StringShort => read_copy::<u16>(data, offset) as usize,
-        Tag::BytesLong | Tag::StringLong => read_copy::<u32>(data, offset) as usize,
-        Tag::BytesHuge | Tag::StringHuge => read_copy::<usize>(data, offset),
-        _ => unreachable!(),
-    };
-    let bytes = &data[*offset..(*offset + len)];
-    *offset += len;
-    match tag {
-        Tag::BytesTiny | Tag::BytesShort | Tag::BytesLong | Tag::BytesHuge => Datum::Bytes(bytes),
-        Tag::StringTiny | Tag::StringShort | Tag::StringLong | Tag::StringHuge => {
-            Datum::String(std::str::from_utf8_unchecked(bytes))
-        }
-        _ => unreachable!(),
-    }
-}
-
-/// Read a datum starting at byte `offset`.
-///
-/// Updates `offset` to point to the first byte after the end of the read region.
-///
-/// # Safety
-///
-/// This function is safe if a `Datum` was previously written at this offset by `push_datum`.
-/// Otherwise it could return invalid values, which is Undefined Behavior.
-unsafe fn read_datum<'a>(data: &'a [u8], offset: &mut usize) -> Datum<'a> {
-    let tag = read_copy::<Tag>(data, offset);
-    match tag {
-        Tag::Null => Datum::Null,
-        Tag::False => Datum::False,
-        Tag::True => Datum::True,
-        Tag::Int16 => {
-            let i = read_copy::<i16>(data, offset);
-            Datum::Int16(i)
-        }
-        Tag::Int32 => {
-            let i = read_copy::<i32>(data, offset);
-            Datum::Int32(i)
-        }
-        Tag::Int64 => {
-            let i = read_copy::<i64>(data, offset);
-            Datum::Int64(i)
-        }
-        Tag::Float32 => {
-            let f = read_copy::<f32>(data, offset);
-            Datum::Float32(OrderedFloat::from(f))
-        }
-        Tag::Float64 => {
-            let f = read_copy::<f64>(data, offset);
-            Datum::Float64(OrderedFloat::from(f))
-        }
-        Tag::Date => {
-            let d = read_copy::<NaiveDate>(data, offset);
-            Datum::Date(d)
-        }
-        Tag::Time => {
-            let t = read_copy::<NaiveTime>(data, offset);
-            Datum::Time(t)
-        }
-        Tag::Timestamp => {
-            let t = read_copy::<NaiveDateTime>(data, offset);
-            Datum::Timestamp(t)
-        }
-        Tag::TimestampTz => {
-            let t = read_copy::<DateTime<Utc>>(data, offset);
-            Datum::TimestampTz(t)
-        }
-        Tag::Interval => {
-            let months = read_copy::<i32>(data, offset);
-            let duration = read_copy::<i128>(data, offset);
-            Datum::Interval(Interval { months, duration })
-        }
-        Tag::BytesTiny
-        | Tag::BytesShort
-        | Tag::BytesLong
-        | Tag::BytesHuge
-        | Tag::StringTiny
-        | Tag::StringShort
-        | Tag::StringLong
-        | Tag::StringHuge => {
-            let datum = read_lengthed_datum(data, offset, tag);
-            datum
-        }
-        Tag::Uuid => {
-            let mut b: uuid::Bytes = [0; 16];
-            b.copy_from_slice(read_untagged_bytes(data, offset));
-            Datum::Uuid(Uuid::from_bytes(b))
-        }
-        Tag::Array => {
-            // See the comment in `Row::push_array` for details on the encoding
-            // of arrays.
-            let ndims = read_copy::<u8>(data, offset);
-            let dims_size = usize::from(ndims) * size_of::<usize>() * 2;
-            let dims = &data[*offset..*offset + dims_size];
-            *offset += dims_size;
-            let data = read_untagged_bytes(data, offset);
-            Datum::Array(Array {
-                dims: ArrayDimensions { data: dims },
-                elements: DatumList { data },
-            })
-        }
-        Tag::List => {
-            let bytes = read_untagged_bytes(data, offset);
-            Datum::List(DatumList { data: bytes })
-        }
-        Tag::Dict => {
-            let bytes = read_untagged_bytes(data, offset);
-            Datum::Map(DatumMap { data: bytes })
-        }
-        Tag::JsonNull => Datum::JsonNull,
-        Tag::Dummy => Datum::Dummy,
-        Tag::Numeric => {
-            let digits = u32::from(read_copy::<u8>(data, offset));
-            let exponent = i32::from(read_copy::<i8>(data, offset));
-            let bits = read_copy::<u8>(data, offset);
-            let lsu_u8_len = Numeric::digits_to_lsu_elements_len(digits) * 2;
-            let lsu_u8 = &data[*offset..(*offset + lsu_u8_len)];
-            *offset += lsu_u8_len;
-            let d = Numeric::from_raw_parts(digits, exponent, bits, lsu_u8);
-            Datum::from(d)
-        }
-    }
-}
 
 // --------------------------------------------------------------------------------
 // writing data
@@ -441,143 +262,6 @@ macro_rules! push_copy {
     };
 }
 
-fn push_untagged_bytes<T: Bytes>(data: &mut T, bytes: &[u8]) {
-    push_copy!(data, bytes.len(), usize);
-    data.extend_from_slice(bytes);
-}
-
-fn push_lengthed_bytes<T: Bytes>(data: &mut T, bytes: &[u8], tag: Tag) {
-    match tag {
-        Tag::BytesTiny | Tag::StringTiny => {
-            push_copy!(data, bytes.len() as u8, u8);
-        }
-        Tag::BytesShort | Tag::StringShort => {
-            push_copy!(data, bytes.len() as u16, u16);
-        }
-        Tag::BytesLong | Tag::StringLong => {
-            push_copy!(data, bytes.len() as u32, u32);
-        }
-        Tag::BytesHuge | Tag::StringHuge => {
-            push_copy!(data, bytes.len() as usize, usize);
-        }
-        _ => unreachable!(),
-    }
-    data.extend_from_slice(bytes);
-}
-
-fn push_datum<T: Bytes>(data: &mut T, datum: Datum) {
-    match datum {
-        Datum::Null => data.push(Tag::Null as u8),
-        Datum::False => data.push(Tag::False as u8),
-        Datum::True => data.push(Tag::True as u8),
-        Datum::Int16(i) => {
-            data.push(Tag::Int16 as u8);
-            push_copy!(data, i, i16);
-        }
-        Datum::Int32(i) => {
-            data.push(Tag::Int32 as u8);
-            push_copy!(data, i, i32);
-        }
-        Datum::Int64(i) => {
-            data.push(Tag::Int64 as u8);
-            push_copy!(data, i, i64);
-        }
-        Datum::Float32(f) => {
-            data.push(Tag::Float32 as u8);
-            push_copy!(data, f.to_bits(), u32);
-        }
-        Datum::Float64(f) => {
-            data.push(Tag::Float64 as u8);
-            push_copy!(data, f.to_bits(), u64);
-        }
-        Datum::Date(d) => {
-            data.push(Tag::Date as u8);
-            push_copy!(data, d, NaiveDate);
-        }
-        Datum::Time(t) => {
-            data.push(Tag::Time as u8);
-            push_copy!(data, t, NaiveTime);
-        }
-        Datum::Timestamp(t) => {
-            data.push(Tag::Timestamp as u8);
-            push_copy!(data, t, NaiveDateTime);
-        }
-        Datum::TimestampTz(t) => {
-            data.push(Tag::TimestampTz as u8);
-            push_copy!(data, t, DateTime<Utc>);
-        }
-        Datum::Interval(i) => {
-            data.push(Tag::Interval as u8);
-            push_copy!(data, i.months, i32);
-            push_copy!(data, i.duration, i128);
-        }
-        Datum::Bytes(bytes) => {
-            let tag = match bytes.len() {
-                0..=255 => Tag::BytesTiny,
-                256..=65535 => Tag::BytesShort,
-                65536..=4294967295 => Tag::BytesLong,
-                _ => Tag::BytesHuge,
-            };
-            data.push(tag as u8);
-            push_lengthed_bytes(data, bytes, tag);
-        }
-        Datum::String(string) => {
-            let tag = match string.len() {
-                0..=255 => Tag::StringTiny,
-                256..=65535 => Tag::StringShort,
-                65536..=4294967295 => Tag::StringLong,
-                _ => Tag::StringHuge,
-            };
-            data.push(tag as u8);
-            push_lengthed_bytes(data, string.as_bytes(), tag);
-        }
-        Datum::Uuid(u) => {
-            data.push(Tag::Uuid as u8);
-            push_untagged_bytes(data, u.as_bytes());
-        }
-        Datum::Array(array) => {
-            // See the comment in `Row::push_array` for details on the encoding
-            // of arrays.
-            data.push(Tag::Array as u8);
-            data.push(array.dims.ndims());
-            data.extend_from_slice(array.dims.data);
-            push_untagged_bytes(data, &array.elements.data);
-        }
-        Datum::List(list) => {
-            data.push(Tag::List as u8);
-            push_untagged_bytes(data, &list.data);
-        }
-        Datum::Map(dict) => {
-            data.push(Tag::Dict as u8);
-            push_untagged_bytes(data, &dict.data);
-        }
-        Datum::JsonNull => data.push(Tag::JsonNull as u8),
-        Datum::Dummy => data.push(Tag::Dummy as u8),
-        Datum::Numeric(mut n) => {
-            // Pseudo-canonical representation of decimal values with
-            // insignificant zeroes trimmed. This compresses the number further
-            // than `Numeric::trim` by removing all zeroes, and not only those in
-            // the fractional component.
-            numeric::cx_datum().reduce(&mut n.0);
-            let (digits, exponent, bits, lsu) = n.0.to_raw_parts();
-            data.push(Tag::Numeric as u8);
-            push_copy!(
-                data,
-                u8::try_from(digits).expect("digits to fit within u8; should not exceed 39"),
-                u8
-            );
-            push_copy!(
-                data,
-                i8::try_from(exponent)
-                    .expect("exponent to fit within i8; should not exceed +/- 39"),
-                i8
-            );
-            data.push(bits);
-            data.extend_from_slice(lsu);
-        }
-    }
-}
-
 /// Return the number of bytes these Datums would use if packed as a Row.
 pub fn row_size<'a, I>(a: I) -> usize
 where
@@ -603,57 +287,8 @@ where
 ///
 /// This is used to optimistically pre-allocate buffers for packing rows.
 pub fn datum_size(datum: &Datum) -> usize {
-    match datum {
-        Datum::Null => 1,
-        Datum::False => 1,
-        Datum::True => 1,
-        Datum::Int16(_) => 1 + size_of::<i16>(),
-        Datum::Int32(_) => 1 + size_of::<i32>(),
-        Datum::Int64(_) => 1 + size_of::<i64>(),
-        Datum::Float32(_) => 1 + size_of::<u32>(),
-        Datum::Float64(_) => 1 + size_of::<u64>(),
-        Datum::Date(_) => 1 + size_of::<NaiveDate>(),
-        Datum::Time(_) => 1 + size_of::<NaiveTime>(),
-        Datum::Timestamp(_) => 1 + size_of::<NaiveDateTime>(),
-        Datum::TimestampTz(_) => 1 + size_of::<DateTime<Utc>>(),
-        Datum::Interval(_) => 1 + size_of::<i32>() + size_of::<i128>(),
-        Datum::Bytes(bytes) => {
-            // We use a variable length representation of slice length.
-            let bytes_for_length = match bytes.len() {
-                0..=255 => 1,
-                256..=65535 => 2,
-                65536..=4294967295 => 4,
-                _ => 8,
-            };
-            1 + bytes_for_length + bytes.len()
-        }
-        Datum::String(string) => {
-            // We use a variable length representation of slice length.
-            let bytes_for_length = match string.len() {
-                0..=255 => 1,
-                256..=65535 => 2,
-                65536..=4294967295 => 4,
-                _ => 8,
-            };
-            1 + bytes_for_length + string.len()
-        }
-        Datum::Uuid(_) => 1 + size_of::<Uuid>(),
-        Datum::Array(array) => {
-            1 + size_of::<u8>() + array.dims.data.len() + array.elements.data.len()
-        }
-        Datum::List(list) => 1 + size_of::<usize>() + list.data.len(),
-        Datum::Map(dict) => 1 + size_of::<usize>() + dict.data.len(),
-        Datum::JsonNull => 1,
-        Datum::Dummy => 1,
-        Datum::Numeric(d) => {
-            let mut d = d.0.clone();
-            // Values must be reduced to determine appropriate number of
-            // coefficient units.
-            numeric::cx_datum().reduce(&mut d);
-            // 4 = 1 bit each for tag, digits, exponent, bits
-            4 + (d.coefficient_units().len() * 2)
-        }
-    }
+    // TODO use cast_from
+    bincode::serialized_size(datum).unwrap() as usize
 }
 
 /// Number of bytes required by a sequence of datums.
@@ -728,7 +363,7 @@ impl Row {
     where
         D: Borrow<Datum<'a>>,
     {
-        push_datum(self, *datum.borrow())
+        bincode::serialize_into(&mut self.data, datum.borrow()).expect("in memory write");
     }
 
     /// Extend an existing `Row` with additional `Datum`s.
@@ -739,7 +374,7 @@ impl Row {
         D: Borrow<Datum<'a>>,
     {
         for datum in iter {
-            push_datum(self, *datum.borrow())
+            self.push(datum);
         }
     }
 
@@ -811,8 +446,7 @@ impl Row {
     /// Iterate the `Datum` elements of the `Row`.
     pub fn iter(&self) -> DatumListIter {
         DatumListIter {
-            data: &self.data,
-            offset: 0,
+            deser: bincode::de::Deserializer::from_slice(&self.data, bincode::config::DefaultOptions::new()),
         }
     }
 
@@ -1040,9 +674,13 @@ impl Row {
     pub fn truncate_datums(&mut self, n: usize) {
         let mut iter = self.iter();
         for _ in iter.by_ref().take(n) {}
-        let offset = iter.offset;
-        // SAFETY: iterator offsets always lie on a datum boundary.
-        unsafe { self.truncate(offset) }
+        if iter.next().is_some() {
+            panic!("can't truncate");
+        }
+        // // TODO: use cast_from
+        // let offset = iter.cursor.position() as usize;
+        // // SAFETY: iterator offsets always lie on a datum boundary.
+        // unsafe { self.truncate(offset) }
     }
 
     /// For debugging only
@@ -1082,8 +720,7 @@ impl<'a> RowRef<'a> {
     /// Iterate the `Datum` elements of the `Row`.
     pub fn iter(&self) -> DatumListIter {
         DatumListIter {
-            data: &self.data,
-            offset: 0,
+            deser: bincode::de::Deserializer::from_slice(&self.data, bincode::config::DefaultOptions::new()),
         }
     }
 }
@@ -1126,8 +763,7 @@ impl<'a> DatumList<'a> {
 
     pub fn iter(&self) -> DatumListIter<'a> {
         DatumListIter {
-            data: self.data,
-            offset: 0,
+            deser: bincode::de::Deserializer::from_slice(self.data, bincode::config::DefaultOptions::new()),
         }
     }
 
@@ -1148,10 +784,14 @@ impl<'a> IntoIterator for &'a DatumList<'a> {
 impl<'a> Iterator for DatumListIter<'a> {
     type Item = Datum<'a>;
     fn next(&mut self) -> Option<Self::Item> {
-        if self.offset >= self.data.len() {
-            None
-        } else {
-            Some(unsafe { read_datum(self.data, &mut self.offset) })
+        match Datum::deserialize(&mut self.deser) {
+            Ok(datum) => Some(datum),
+            Err(e) => match *e {
+                bincode::ErrorKind::Io(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                    None
+                },
+                e => panic!("error de-serializing MyStruct {}", e),
+            }
         }
     }
 }
@@ -1163,8 +803,7 @@ impl<'a> DatumMap<'a> {
 
     pub fn iter(&self) -> DatumDictIter<'a> {
         DatumDictIter {
-            data: self.data,
-            offset: 0,
+            deser: bincode::de::Deserializer::from_slice(self.data, bincode::config::DefaultOptions::new()),
             prev_key: None,
         }
     }
@@ -1192,22 +831,8 @@ impl<'a> IntoIterator for &'a DatumMap<'a> {
 impl<'a> Iterator for DatumDictIter<'a> {
     type Item = (&'a str, Datum<'a>);
     fn next(&mut self) -> Option<Self::Item> {
-        if self.offset >= self.data.len() {
-            None
-        } else {
-            Some(unsafe {
-                let key_tag = read_copy::<Tag>(self.data, &mut self.offset);
-                assert!(
-                    key_tag == Tag::StringTiny
-                        || key_tag == Tag::StringShort
-                        || key_tag == Tag::StringLong
-                        || key_tag == Tag::StringHuge,
-                    "Dict keys must be strings, got {:?}",
-                    key_tag
-                );
-                let key = read_lengthed_datum(self.data, &mut self.offset, key_tag).unwrap_str();
-                let val = read_datum(self.data, &mut self.offset);
-
+        match <(&'a str, Datum<'a>)>::deserialize(&mut self.deser) {
+            Ok((key, val)) => {
                 // if in debug mode, sanity check keys
                 if cfg!(debug_assertions) {
                     if let Some(prev_key) = self.prev_key {
@@ -1220,9 +845,9 @@ impl<'a> Iterator for DatumDictIter<'a> {
                     }
                     self.prev_key = Some(key);
                 }
-
-                (key, val)
-            })
+                Some((key, val))
+            },
+            Err(e) => None,
         }
     }
 }
@@ -1270,6 +895,7 @@ impl RowArena {
     pub fn push_unary_row<'a>(&'a self, row: Row) -> Datum<'a> {
         let mut inner = self.inner.borrow_mut();
         inner.push(row.data.into_vec());
+
         unsafe {
             // This is safe because:
             //   * We only ever append to self.inner, so the row data will live
@@ -1280,7 +906,7 @@ impl RowArena {
             //     and moves the row.
             //   * We don't allow access to the byte vector itself, so it will
             //     never reallocate.
-            let datum = read_datum(&inner[inner.len() - 1], &mut 0);
+            let datum: Datum = bincode::deserialize(&inner[inner.len() - 1]).unwrap();
             transmute::<Datum<'_>, Datum<'a>>(datum)
         }
     }

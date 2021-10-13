@@ -20,7 +20,7 @@
 //! * [`RelationDesc`] describes what it takes to extend a `Row` vertically, and
 //!   corresponds most closely to what is returned from querying our dataflows
 
-#![warn(missing_debug_implementations)]
+#![allow(missing_debug_implementations)]
 
 mod relation;
 mod row;
