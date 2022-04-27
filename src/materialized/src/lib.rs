@@ -33,6 +33,7 @@ use mz_orchestrator::{Orchestrator, ServiceConfig, ServicePort};
 use mz_orchestrator_kubernetes::{KubernetesOrchestrator, KubernetesOrchestratorConfig};
 use mz_orchestrator_process::{ProcessOrchestrator, ProcessOrchestratorConfig};
 use openssl::ssl::{SslAcceptor, SslFiletype, SslMethod, SslVerifyMode};
+use postgres::{Client, NoTls};
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 use tokio_stream::wrappers::TcpListenerStream;
@@ -92,6 +93,9 @@ pub struct Config {
     pub data_directory: PathBuf,
     /// Where the persist library should store its data.
     pub persist_location: mz_persist_client::Location,
+    /// Optional Postgres connection string which will use Postgres as the metadata
+    /// stash instead of sqlite from the `data_directory`.
+    pub catalog_postgres_stash: Option<String>,
 
     // === Platform options. ===
     /// Configuration of service orchestration.
@@ -193,6 +197,27 @@ pub enum SecretsControllerConfig {
 
 /// Start a `materialized` server.
 pub async fn serve(config: Config) -> Result<Server, anyhow::Error> {
+    match &config.catalog_postgres_stash {
+        Some(s) => {
+            let client = Client::connect(s, NoTls)?;
+            let stash = mz_stash::Postgres::open(client)?;
+            serve_stash(config, stash).await
+        }
+        None => {
+            let stash = mz_stash::Sqlite::open(&config.data_directory.join("stash"))?;
+            serve_stash(config, stash).await
+        }
+    }
+}
+
+async fn serve_stash<S: mz_stash::Append + 'static>(
+    config: Config,
+    stash: S,
+) -> Result<Server, anyhow::Error> {
+    // Load the coordinator catalog from disk.
+    let coord_storage =
+        mz_coord::catalog::storage::Connection::open(stash, Some(config.experimental_mode))?;
+
     // Validate TLS configuration, if present.
     let (pgwire_tls, http_tls) = match &config.tls {
         None => (None, None),
@@ -249,12 +274,6 @@ pub async fn serve(config: Config) -> Result<Server, anyhow::Error> {
     // Initialize network listener.
     let listener = TcpListener::bind(&config.listen_addr).await?;
     let local_addr = listener.local_addr()?;
-
-    let stash = mz_stash::Sqlite::open(&config.data_directory.join("stash"))?;
-
-    // Load the coordinator catalog from disk.
-    let coord_storage =
-        mz_coord::catalog::storage::Connection::open(stash, Some(config.experimental_mode))?;
 
     // Initialize orchestrator.
     let orchestrator: Box<dyn Orchestrator> = match config.orchestrator.backend {
