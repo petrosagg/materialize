@@ -64,6 +64,14 @@ pub struct Postgres {
     epoch: i64,
 }
 
+impl std::fmt::Debug for Postgres {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Postgres")
+            .field("epoch", &self.epoch)
+            .finish_non_exhaustive()
+    }
+}
+
 impl Postgres {
     /// Opens the stash stored at the specified path.
     pub fn open(mut conn: Client) -> Result<Postgres, StashError> {

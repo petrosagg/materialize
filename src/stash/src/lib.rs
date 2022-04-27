@@ -48,7 +48,7 @@ pub type Id = i64;
 /// truth, the intent is to swap all stashes for STORAGE collections.
 ///
 /// [STORAGE]: https://github.com/MaterializeInc/materialize/blob/main/doc/developer/platform/architecture-db.md#STORAGE
-pub trait Stash {
+pub trait Stash: std::fmt::Debug + Send {
     /// Loads or creates the named collection.
     ///
     /// If the collection with the specified name does not yet exist, it is

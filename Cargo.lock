@@ -2883,6 +2883,7 @@ dependencies = [
  "mz-secrets",
  "mz-secrets-filesystem",
  "mz-secrets-kubernetes",
+ "mz-stash",
  "native-tls",
  "nix",
  "num_cpus",

@@ -18,6 +18,7 @@ use anyhow::bail;
 use chrono::{DateTime, TimeZone, Utc};
 use itertools::Itertools;
 use lazy_static::lazy_static;
+use mz_stash::{Append, Sqlite};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use tracing::{info, trace};
@@ -52,7 +53,6 @@ use mz_sql::plan::{
     CreateTablePlan, CreateTypePlan, CreateViewPlan, Params, Plan, PlanContext, StatementDesc,
 };
 use mz_sql::DEFAULT_SCHEMA;
-use mz_stash::Append;
 use mz_transform::Optimizer;
 use uuid::Uuid;
 
@@ -103,11 +103,23 @@ const SYSTEM_USER: &str = "mz_system";
 /// The catalog also maintains special "ambient schemas": virtual schemas,
 /// implicitly present in all databases, that house various system views.
 /// The big examples of ambient schemas are `pg_catalog` and `mz_catalog`.
-#[derive(Debug, Clone)]
-pub struct Catalog {
+#[derive(Debug)]
+pub struct Catalog<S> {
     state: CatalogState,
-    storage: Arc<Mutex<storage::Connection>>,
+    storage: Arc<Mutex<storage::Connection<S>>>,
     transient_revision: u64,
+}
+
+// Implement our own Clone because derive can't unless S is Clone, which it's
+// not (hence the Arc).
+impl<S> Clone for Catalog<S> {
+    fn clone(&self) -> Self {
+        Self {
+            state: self.state.clone(),
+            storage: Arc::clone(&self.storage),
+            transient_revision: self.transient_revision,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -629,8 +641,8 @@ impl CatalogState {
 }
 
 #[derive(Debug)]
-pub struct ConnCatalog<'a> {
-    catalog: &'a Catalog,
+pub struct ConnCatalog<'a, S> {
+    catalog: &'a Catalog<S>,
     conn_id: u32,
     compute_instance: String,
     database: Option<DatabaseId>,
@@ -639,7 +651,7 @@ pub struct ConnCatalog<'a> {
     prepared_statements: Option<&'a HashMap<String, PreparedStatement>>,
 }
 
-impl ConnCatalog<'_> {
+impl<S> ConnCatalog<'_, S> {
     pub fn conn_id(&self) -> u32 {
         self.conn_id
     }
@@ -1108,12 +1120,50 @@ struct AllocatedBuiltinSystemIds<T> {
     migrated_builtins: Vec<(T, GlobalId)>,
 }
 
-impl Catalog {
+impl Catalog<Sqlite> {
+    /// Opens the catalog at `path` with parameters set appropriately for debug
+    /// contexts, like in tests.
+    ///
+    /// WARNING! This function can arbitrarily fail because it does not make any
+    /// effort to adjust the catalog's contents' structure or semantics to the
+    /// currently running version, i.e. it does not apply any migrations.
+    ///
+    /// This function should not be called in production contexts. Use
+    /// [`Catalog::open`] with appropriately set configuration parameters
+    /// instead.
+    pub async fn open_debug(
+        data_dir_path: &Path,
+        now: NowFn,
+    ) -> Result<Catalog<Sqlite>, anyhow::Error> {
+        let experimental_mode = None;
+        let metrics_registry = &MetricsRegistry::new();
+        let stash = mz_stash::Sqlite::open(&data_dir_path.join("stash"))?;
+        let storage = storage::Connection::open(stash, experimental_mode)?;
+        let (catalog, _) = Self::open(Config {
+            storage,
+            experimental_mode,
+            safe_mode: false,
+            build_info: &DUMMY_BUILD_INFO,
+            aws_external_id: AwsExternalId::NotProvided,
+            timestamp_frequency: Duration::from_secs(1),
+            now,
+            skip_migrations: true,
+            metrics_registry,
+            disable_user_indexes: false,
+        })
+        .await?;
+        Ok(catalog)
+    }
+}
+
+impl<S: Append> Catalog<S> {
     /// Opens or creates a catalog that stores data at `path`.
     ///
     /// Returns the catalog and a list of updates to builtin tables that
     /// describe the initial state of the catalog.
-    pub async fn open(config: Config<'_>) -> Result<(Catalog, Vec<BuiltinTableUpdate>), Error> {
+    pub async fn open(
+        config: Config<'_, S>,
+    ) -> Result<(Catalog<S>, Vec<BuiltinTableUpdate>), Error> {
         let mut catalog = Catalog {
             state: CatalogState {
                 database_by_name: BTreeMap::new(),
@@ -1573,10 +1623,10 @@ impl Catalog {
     /// objects, which is necessary for at least one catalog migration.
     ///
     /// TODO(justin): it might be nice if these were two different types.
-    pub fn load_catalog_items<S: Append>(
+    pub fn load_catalog_items(
         tx: &mut storage::Transaction<S>,
-        c: &Catalog,
-    ) -> Result<Catalog, Error> {
+        c: &Catalog<S>,
+    ) -> Result<Catalog<S>, Error> {
         let mut c = c.clone();
         let items = tx.loaded_items();
         for (id, name, def) in items {
@@ -1608,37 +1658,7 @@ impl Catalog {
         Ok(c)
     }
 
-    /// Opens the catalog at `path` with parameters set appropriately for debug
-    /// contexts, like in tests.
-    ///
-    /// WARNING! This function can arbitrarily fail because it does not make any
-    /// effort to adjust the catalog's contents' structure or semantics to the
-    /// currently running version, i.e. it does not apply any migrations.
-    ///
-    /// This function should not be called in production contexts. Use
-    /// [`Catalog::open`] with appropriately set configuration parameters
-    /// instead.
-    pub async fn open_debug(data_dir_path: &Path, now: NowFn) -> Result<Catalog, anyhow::Error> {
-        let experimental_mode = None;
-        let metrics_registry = &MetricsRegistry::new();
-        let storage = storage::Connection::open(data_dir_path, experimental_mode)?;
-        let (catalog, _) = Self::open(Config {
-            storage,
-            experimental_mode,
-            safe_mode: false,
-            build_info: &DUMMY_BUILD_INFO,
-            aws_external_id: AwsExternalId::NotProvided,
-            timestamp_frequency: Duration::from_secs(1),
-            now,
-            skip_migrations: true,
-            metrics_registry,
-            disable_user_indexes: false,
-        })
-        .await?;
-        Ok(catalog)
-    }
-
-    pub fn for_session<'a>(&'a self, session: &'a Session) -> ConnCatalog<'a> {
+    pub fn for_session<'a>(&'a self, session: &'a Session) -> ConnCatalog<'a, S> {
         let database = self
             .state
             .database_by_name
@@ -1663,7 +1683,7 @@ impl Catalog {
         }
     }
 
-    pub fn for_sessionless_user(&self, user: String) -> ConnCatalog {
+    pub fn for_sessionless_user(&self, user: String) -> ConnCatalog<S> {
         ConnCatalog {
             catalog: self,
             conn_id: SYSTEM_CONN_ID,
@@ -1680,11 +1700,11 @@ impl Catalog {
 
     // Leaving the system's search path empty allows us to catch issues
     // where catalog object names have not been normalized correctly.
-    pub fn for_system_session(&self) -> ConnCatalog {
+    pub fn for_system_session(&self) -> ConnCatalog<S> {
         self.for_sessionless_user(SYSTEM_USER.into())
     }
 
-    fn storage(&self) -> MutexGuard<storage::Connection> {
+    fn storage(&self) -> MutexGuard<storage::Connection<S>> {
         self.storage.lock().expect("lock poisoned")
     }
 
@@ -2984,7 +3004,7 @@ impl From<PlanContext> for SerializedPlanContext {
     }
 }
 
-impl ConnCatalog<'_> {
+impl<S: Append> ConnCatalog<'_, S> {
     fn resolve_item_name(
         &self,
         name: &PartialObjectName,
@@ -3034,7 +3054,7 @@ impl ConnCatalog<'_> {
     }
 }
 
-impl ExprHumanizer for ConnCatalog<'_> {
+impl<S: Append> ExprHumanizer for ConnCatalog<'_, S> {
     fn humanize_id(&self, id: GlobalId) -> Option<String> {
         self.catalog
             .state
@@ -3116,7 +3136,7 @@ impl ExprHumanizer for ConnCatalog<'_> {
     }
 }
 
-impl SessionCatalog for ConnCatalog<'_> {
+impl<S: Append> SessionCatalog for ConnCatalog<'_, S> {
     fn active_user(&self) -> &str {
         &self.user
     }
