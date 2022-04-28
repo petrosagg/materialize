@@ -4032,15 +4032,17 @@ name = "mz-stash"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "criterion",
  "differential-dataflow",
+ "futures",
  "mz-ore",
  "mz-persist-types",
  "num",
- "postgres",
  "rusqlite",
  "tempfile",
  "timely",
+ "tokio-postgres",
 ]
 
 [[package]]
