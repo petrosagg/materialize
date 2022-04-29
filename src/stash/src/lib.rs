@@ -64,10 +64,7 @@ pub trait Stash: std::fmt::Debug + Send {
     ///
     /// It is valid to construct multiple handles to the same named collection
     /// and use them simultaneously.
-    async fn collection<'a, K, V>(
-        &'a mut self,
-        name: &'a str,
-    ) -> Result<StashCollection<K, V>, StashError>
+    async fn collection<K, V>(&mut self, name: &str) -> Result<StashCollection<K, V>, StashError>
     where
         K: Data,
         V: Data;
@@ -279,10 +276,10 @@ pub trait Stash: std::fmt::Debug + Send {
     ///
     /// Intuitively, this method declares that all times less than `upper` are
     /// definite.
-    async fn seal<'a, K, V>(
-        &'a mut self,
+    async fn seal<K, V>(
+        &mut self,
         collection: StashCollection<K, V>,
-        upper: AntichainRef<'a, Timestamp>,
+        upper: AntichainRef<'_, Timestamp>,
     ) -> Result<(), StashError>
     where
         K: Data,
@@ -292,9 +289,9 @@ pub trait Stash: std::fmt::Debug + Send {
     /// performing the individual seals one by one.
     ///
     /// See [Stash::seal]
-    async fn seal_batch<'a, K, V>(
-        &'a mut self,
-        seals: &'a [(StashCollection<K, V>, Antichain<Timestamp>)],
+    async fn seal_batch<K, V>(
+        &mut self,
+        seals: &[(StashCollection<K, V>, Antichain<Timestamp>)],
     ) -> Result<(), StashError>
     where
         K: Data,
@@ -326,9 +323,9 @@ pub trait Stash: std::fmt::Debug + Send {
     /// performing the individual compactions one by one.
     ///
     /// See [Stash::compact]
-    async fn compact_batch<'a, K, V>(
-        &'a mut self,
-        compactions: &'a [(StashCollection<K, V>, Antichain<Timestamp>)],
+    async fn compact_batch<K, V>(
+        &mut self,
+        compactions: &[(StashCollection<K, V>, Antichain<Timestamp>)],
     ) -> Result<(), StashError>
     where
         K: Data,
@@ -357,9 +354,9 @@ pub trait Stash: std::fmt::Debug + Send {
     /// performing the individual consolidations one by one.
     ///
     /// See [Stash::consolidate]
-    async fn consolidate_batch<'a, K, V>(
-        &'a mut self,
-        collections: &'a [StashCollection<K, V>],
+    async fn consolidate_batch<K, V>(
+        &mut self,
+        collections: &[StashCollection<K, V>],
     ) -> Result<(), StashError>
     where
         K: Data,
@@ -515,7 +512,7 @@ impl From<&str> for StashError {
 pub trait Append: Stash {
     async fn append<I>(&mut self, batches: I) -> Result<(), StashError>
     where
-        I: IntoIterator<Item = AppendBatch> + Send,
+        I: IntoIterator<Item = AppendBatch> + Send + 'static,
         I::IntoIter: Send;
 }
 

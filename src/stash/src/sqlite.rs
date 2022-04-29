@@ -159,10 +159,7 @@ impl Sqlite {
 
 #[async_trait]
 impl Stash for Sqlite {
-    async fn collection<'a, K, V>(
-        &'a mut self,
-        name: &'a str,
-    ) -> Result<StashCollection<K, V>, StashError>
+    async fn collection<K, V>(&mut self, name: &str) -> Result<StashCollection<K, V>, StashError>
     where
         K: Codec + Ord,
         V: Codec + Ord,
@@ -307,10 +304,10 @@ impl Stash for Sqlite {
         Ok(())
     }
 
-    async fn seal<'a, K, V>(
-        &'a mut self,
+    async fn seal<K, V>(
+        &mut self,
         collection: StashCollection<K, V>,
-        new_upper: AntichainRef<'a, Timestamp>,
+        new_upper: AntichainRef<'_, Timestamp>,
     ) -> Result<(), StashError>
     where
         K: Data,
@@ -319,9 +316,9 @@ impl Stash for Sqlite {
         self.seal_batch(&[(collection, new_upper.to_owned())]).await
     }
 
-    async fn seal_batch<'a, K, V>(
-        &'a mut self,
-        seals: &'a [(StashCollection<K, V>, Antichain<Timestamp>)],
+    async fn seal_batch<K, V>(
+        &mut self,
+        seals: &[(StashCollection<K, V>, Antichain<Timestamp>)],
     ) -> Result<(), StashError>
     where
         K: Data,
@@ -349,9 +346,9 @@ impl Stash for Sqlite {
             .await
     }
 
-    async fn compact_batch<'a, K, V>(
-        &'a mut self,
-        compactions: &'a [(StashCollection<K, V>, Antichain<Timestamp>)],
+    async fn compact_batch<K, V>(
+        &mut self,
+        compactions: &[(StashCollection<K, V>, Antichain<Timestamp>)],
     ) -> Result<(), StashError>
     where
         K: Data,
@@ -397,9 +394,9 @@ impl Stash for Sqlite {
         self.consolidate_batch(&[collection]).await
     }
 
-    async fn consolidate_batch<'a, K, V>(
-        &'a mut self,
-        collections: &'a [StashCollection<K, V>],
+    async fn consolidate_batch<K, V>(
+        &mut self,
+        collections: &[StashCollection<K, V>],
     ) -> Result<(), StashError>
     where
         K: Data,
