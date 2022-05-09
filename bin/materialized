@@ -20,7 +20,7 @@ release=false
 channel=
 build_flags=()
 positional_args=()
-rustflags=""
+rustflags=${RUSTFLAGS:-""}
 
 while [[ $# -gt 0 ]]; do
     case $1 in
