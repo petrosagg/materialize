@@ -48,18 +48,20 @@ impl Action for CreateBucketAction {
         let bucket = format!("{}-{}", self.bucket_prefix, state.seed);
         println!("Creating S3 bucket {}", bucket);
 
+        let bucket_config = match state.aws_region() {
+            "us-east-1" => None,
+            name => Some(
+                CreateBucketConfiguration::builder()
+                    .location_constraint(BucketLocationConstraint::from(name))
+                    .build(),
+            ),
+        };
+
         match state
             .s3_client
             .create_bucket()
             .bucket(&bucket)
-            .set_create_bucket_configuration(match state.aws_region() {
-                "us-east-1" => None,
-                name => Some(
-                    CreateBucketConfiguration::builder()
-                        .location_constraint(BucketLocationConstraint::from(name))
-                        .build(),
-                ),
-            })
+            .set_create_bucket_configuration(bucket_config)
             .send()
             .await
         {

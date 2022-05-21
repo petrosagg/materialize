@@ -16,10 +16,10 @@ use std::time::SystemTime;
 
 use anyhow::{bail, Context};
 use async_trait::async_trait;
+use futures::stream::StreamExt;
 use md5::{Digest, Md5};
 use postgres_array::Array;
 use regex::Regex;
-use tokio::sync::Mutex;
 use tokio_postgres::error::DbError;
 use tokio_postgres::row::Row;
 use tokio_postgres::types::{FromSql, Type};
@@ -166,46 +166,65 @@ impl Action for SqlAction {
             _ => true,
         };
 
-        let state = &state;
-        let res = match should_retry {
-            true => Retry::default()
+        let retry_stream = if should_retry {
+            Retry::default()
                 .initial_backoff(state.initial_backoff)
                 .factor(state.backoff_factor)
-                .max_duration(state.timeout)
-                .max_tries(state.max_tries),
-            false => Retry::default().max_duration(state.timeout).max_tries(1),
-        }
-        .retry_async_canceling(|retry_state| async move {
-            match self.try_redo(state, &query).await {
-                Ok(()) => {
-                    if retry_state.i != 0 {
-                        println!();
-                    }
-                    println!(
-                        "rows match; continuing at ts {}",
-                        SystemTime::now()
-                            .duration_since(SystemTime::UNIX_EPOCH)
-                            .unwrap()
-                            .as_secs_f64()
-                    );
-                    Ok(())
-                }
-                Err(e) => {
-                    if retry_state.i == 0 && should_retry {
-                        print!("rows didn't match; sleeping to see if dataflow catches up");
-                    }
-                    if let Some(backoff) = retry_state.next_backoff {
-                        if !backoff.is_zero() {
-                            print!(" {:.0?}", backoff);
-                            io::stdout().flush().unwrap();
+                .max_tries(state.max_tries)
+                .into_retry_stream()
+        } else {
+            Retry::default().max_tries(1).into_retry_stream()
+        };
+        tokio::pin!(retry_stream);
+
+        let deadline = tokio::time::Instant::now() + state.timeout;
+
+        let mut res = None;
+        while let Some(retry_state) = retry_stream.next().await {
+            let action = async {
+                match self.try_redo(state, &query).await {
+                    Ok(()) => {
+                        if retry_state.i != 0 {
+                            println!();
                         }
+                        println!(
+                            "rows match; continuing at ts {}",
+                            SystemTime::now()
+                                .duration_since(SystemTime::UNIX_EPOCH)
+                                .unwrap()
+                                .as_secs_f64()
+                        );
+                        Ok(())
                     }
-                    Err(e)
+                    Err(e) => {
+                        if retry_state.i == 0 && should_retry {
+                            print!("rows didn't match; sleeping to see if dataflow catches up");
+                        }
+                        if let Some(backoff) = retry_state.next_backoff {
+                            if !backoff.is_zero() {
+                                print!(" {:.0?}", backoff);
+                                io::stdout().flush().unwrap();
+                            }
+                        }
+                        Err(e)
+                    }
+                }
+            };
+            match tokio::time::timeout_at(deadline, action).await {
+                Ok(Ok(())) => {
+                    res = Some(Ok(()));
+                    break;
+                }
+                Ok(Err(e)) => res = Some(Err(e)),
+                Err(e) => {
+                    // res = Some(Err(err.unwrap_or_else(|| e.into())),
+                    res = Some(Err(e.into()));
+                    break;
                 }
             }
-        })
-        .await;
-        if let Err(e) = res {
+        }
+
+        if let Err(e) = res.expect("retry produces at least one element") {
             println!();
             return Err(e);
         }
@@ -259,7 +278,7 @@ impl SqlAction {
         Ok(())
     }
 
-    async fn try_redo(&self, state: &State, query: &str) -> Result<(), anyhow::Error> {
+    async fn try_redo(&self, state: &mut State, query: &str) -> Result<(), anyhow::Error> {
         let stmt = state
             .pgclient
             .prepare(query)
@@ -454,40 +473,60 @@ impl Action for FailSqlAction {
             Some(_) => true,
         };
 
-        let state = &state;
-        let res = match should_retry {
-            true => Retry::default()
+        let retry_stream = if should_retry {
+            Retry::default()
                 .initial_backoff(state.initial_backoff)
                 .factor(state.backoff_factor)
-                .max_duration(state.timeout)
-                .max_tries(state.max_tries),
-            false => Retry::default().max_duration(state.timeout).max_tries(1),
-        }.retry_async_canceling(|retry_state| async move {
-            match self.try_redo(state, &query).await {
-                Ok(()) => {
-                    if retry_state.i != 0 {
-                        println!();
+                .max_tries(state.max_tries)
+                .into_retry_stream()
+        } else {
+            Retry::default().max_tries(1).into_retry_stream()
+        };
+        tokio::pin!(retry_stream);
+
+        let deadline = tokio::time::Instant::now() + state.timeout;
+
+        let mut res = None;
+        while let Some(retry_state) = retry_stream.next().await {
+            let action = async {
+                match self.try_redo(state, &query).await {
+                    Ok(()) => {
+                        if retry_state.i != 0 {
+                            println!();
+                        }
+                        println!("query error matches; continuing");
+                        Ok(())
                     }
-                    println!("query error matches; continuing");
-                    Ok(())
+                    Err(e) => {
+                        if retry_state.i == 0 && should_retry {
+                            print!("query error didn't match; sleeping to see if dataflow produces error shortly");
+                        }
+                        if let Some(backoff) = retry_state.next_backoff {
+                            print!(" {:.0?}", backoff);
+                            io::stdout().flush().unwrap();
+                        } else {
+                            println!();
+                        }
+                        Err(e)
+                    }
                 }
+            };
+            match tokio::time::timeout_at(deadline, action).await {
+                Ok(Ok(())) => {
+                    res = Some(Ok(()));
+                    break;
+                }
+                Ok(Err(e)) => res = Some(Err(e)),
                 Err(e) => {
-                    if retry_state.i == 0 && should_retry {
-                        print!("query error didn't match; sleeping to see if dataflow produces error shortly");
-                    }
-                    if let Some(backoff) = retry_state.next_backoff {
-                        print!(" {:.0?}", backoff);
-                        io::stdout().flush().unwrap();
-                    } else {
-                        println!();
-                    }
-                    Err(e)
+                    // res = Some(Err(err.unwrap_or_else(|| e.into())),
+                    res = Some(Err(e.into()));
+                    break;
                 }
             }
-        }).await;
+        }
 
         // Check the error again in order to detech 'deadline has elapsed' timeout errors
-        if let Err(err) = res {
+        if let Err(err) = res.expect("retry produces at least one element") {
             self.check_error(state, &err.to_string())?;
         }
 
@@ -496,7 +535,7 @@ impl Action for FailSqlAction {
 }
 
 impl FailSqlAction {
-    async fn try_redo(&self, state: &State, query: &str) -> Result<(), anyhow::Error> {
+    async fn try_redo(&self, state: &mut State, query: &str) -> Result<(), anyhow::Error> {
         match state.pgclient.query(query, &[]).await {
             Ok(_) => bail!(
                 "query succeeded, but expected error '{}'",
@@ -509,7 +548,7 @@ impl FailSqlAction {
         }
     }
 
-    fn check_error(&self, state: &State, err_string: &String) -> Result<(), anyhow::Error> {
+    fn check_error(&self, state: &mut State, err_string: &String) -> Result<(), anyhow::Error> {
         let mut err_string = err_string.clone();
 
         if let Some(regex) = &state.regex {
@@ -545,9 +584,7 @@ impl Action for SendSqlAction {
         let query = self.query.clone();
         state.pgclient_futures.insert(
             "foo".to_string(),
-            Mutex::new(Box::pin(async move {
-                pgclient.execute(query.as_str(), &[]).await
-            })),
+            Box::pin(async move { pgclient.execute(query.as_str(), &[]).await }),
         );
 
         Ok(ControlFlow::Continue)
@@ -567,8 +604,7 @@ impl Action for ReapSqlAction {
     }
 
     async fn redo(&self, state: &mut State) -> Result<ControlFlow, anyhow::Error> {
-        let mut pgclient_future = state.pgclient_futures.get_mut("foo").unwrap().lock().await;
-        (&mut *pgclient_future).await?;
+        state.pgclient_futures.get_mut("foo").unwrap().await?;
 
         Ok(ControlFlow::Continue)
     }
@@ -578,7 +614,7 @@ pub fn print_query(query: &str) {
     println!("> {}", query);
 }
 
-pub fn decode_row(state: &State, row: Row) -> Result<Vec<String>, anyhow::Error> {
+pub fn decode_row(state: &mut State, row: Row) -> Result<Vec<String>, anyhow::Error> {
     enum ArrayElement<T> {
         Null,
         NonNull(T),

@@ -34,7 +34,6 @@ use mz_ore::now::NOW_ZERO;
 use rand::Rng;
 use rdkafka::ClientConfig;
 use regex::{Captures, Regex};
-use tokio::sync::Mutex;
 use tokio_postgres::NoTls;
 use url::Url;
 
@@ -159,8 +158,7 @@ pub struct State {
     materialized_addr: String,
     materialized_user: String,
     pgclient: Arc<tokio_postgres::Client>,
-    pgclient_futures:
-        HashMap<String, Mutex<BoxFuture<'static, Result<u64, tokio_postgres::Error>>>>,
+    pgclient_futures: HashMap<String, BoxFuture<'static, Result<u64, tokio_postgres::Error>>>,
 
     // === Confluent state. ===
     schema_registry_url: Url,
@@ -193,7 +191,7 @@ pub struct State {
 impl State {
     /// Makes of copy of the stash's catalog and runs a function on its
     /// state. Returns `None` if there's no catalog information in the State.
-    pub async fn with_catalog_copy<F, T>(&self, f: F) -> Result<Option<T>, anyhow::Error>
+    pub async fn with_catalog_copy<F, T>(&mut self, f: F) -> Result<Option<T>, anyhow::Error>
     where
         F: FnOnce(ConnCatalog) -> T,
     {
@@ -446,7 +444,7 @@ where
 
 pub(crate) async fn build(
     cmds: Vec<PosCommand>,
-    state: &State,
+    state: &mut State,
 ) -> Result<Vec<PosAction>, PosError> {
     let mut out = Vec::new();
     let mut vars = HashMap::new();

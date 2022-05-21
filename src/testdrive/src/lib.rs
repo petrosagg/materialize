@@ -81,7 +81,7 @@ async fn run_line_reader(
     // connections until after parsing.
     let cmds = parser::parse(line_reader)?;
     let (mut state, state_cleanup) = action::create_state(config).await?;
-    let actions = action::build(cmds, &state).await?;
+    let actions = action::build(cmds, &mut state).await?;
 
     if config.reset {
         state.reset_materialized().await?;
