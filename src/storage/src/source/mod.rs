@@ -1008,7 +1008,6 @@ where
         let source_connector = source_connector.clone();
         let mut source_reader = Box::pin(async_stream::stream!({
             let mut timestamper = match ReclockOperator::new(
-                name.clone(),
                 storage_metadata,
                 now,
                 timestamp_frequency.clone(),
@@ -1023,9 +1022,15 @@ where
                 }
             };
 
-            // TODO: Use the persisted partition offsets to skip forward
-            let start_offsets = vec![];
+            // TODO: Use the persisted upper to skip forward
+            // This is the read frontier of the source holding onto a mapping of (pid -> offset)
+            // with all pids that map to zero omitted and implied
+            let mut read_frontier: HashMap<PartitionId, MzOffset> = HashMap::new();
 
+            let start_offsets: Vec<(PartitionId, Option<MzOffset>)> = read_frontier
+                .iter()
+                .map(|(pid, offset)| (pid.clone(), Some(offset.clone())))
+                .collect();
             let source_reader = S::new(
                 name.clone(),
                 id,
@@ -1050,86 +1055,63 @@ where
 
             let mut timestamp_interval = tokio::time::interval(timestamp_frequency);
             timestamp_interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
-            let mut untimestamped_messages = HashMap::<_, Vec<_>>::new();
-            let mut pending_messages = vec![];
+            let mut pending_messages: HashMap<PartitionId, Vec<(MzOffset, _)>> = HashMap::new();
+            let mut non_definite_errors = vec![];
             loop {
                 // TODO(guswyn): move lots of this out of the macro so rustfmt works better
                 tokio::select! {
                     // N.B. This branch is cancel-safe because `next` only borrows the underlying stream.
-                    item = source_stream.next() => {
+                    Some(item) = source_stream.next() => {
                         match item {
-                            Some(Ok(message)) => match message {
+                            Ok(message) => match message {
                                 // Note that this
                                 // 1. Requires that sources that produce `InProgress` messages
                                 //    ALWAYS produce a `Finalized` for the final message.
                                 // 2. Requires that sources that produce `InProgress` messages
                                 //    NEVER produces messages at offsets below the most recent
                                 //    `Finalized` message.
-                                // 3. Buffers EVERY message associated with a single offset. This
-                                //    can be improved, tracked in
-                                //    <https://github.com/MaterializeInc/materialize/issues/12557>
-                                SourceMessageType::Finalized(message) => {
-                                    if let Some(untimestamped_messages) = untimestamped_messages.get_mut(
-                                        &message.partition
-                                    ) {
-                                        pending_messages.extend(untimestamped_messages.drain(..));
-                                    }
-                                    pending_messages.push(Ok(message));
+                                SourceMessageType::Finalized(msg) => {
+                                    let pid = msg.partition.clone();
+                                    // This is the final msg for this offset so we can advance
+                                    // our read frontier
+                                    let prev = read_frontier.insert(pid.clone(), msg.offset + 1);
+                                    assert!(prev.unwrap_or_default() < msg.offset);
+
+                                    pending_messages.entry(pid).or_default().push((msg.offset, msg));
+
                                 }
-                                SourceMessageType::InProgress(message) => {
-                                    // this extra if-statement is just here to avoid a clone in
-                                    // case we have expensive partition id's someday
-                                    if let Some(untimestamped_messages) = untimestamped_messages.get_mut(
-                                        &message.partition
-                                    ) {
-                                        untimestamped_messages.push(Ok(message))
-                                    } else {
-                                        untimestamped_messages
-                                            .entry(message.partition.clone())
-                                            .or_default()
-                                            .push(Ok(message))
-                                    }
+                                SourceMessageType::InProgress(msg) => {
+                                    let pid = msg.partition.clone();
+                                    pending_messages.entry(pid.clone()).or_default().push((msg.offset, msg));
                                 }
                             }
-                            // TODO: make errors definite
-                            Some(Err(e)) => pending_messages.push(Err(e)),
-                            None => {},
+                            Err(e) => {
+                                // TODO: make errors definite and process them through the same
+                                // machinery as normal messages
+                                non_definite_errors.push(e);
+                            },
                         }
                     }
                     // It's time to timestamp a batch
                     _ = timestamp_interval.tick() => {
-                        let mut max_offsets = HashMap::new();
-                        for message in pending_messages.iter().filter_map(|m| m.as_ref().ok()) {
-                            let entry = max_offsets.entry(message.partition.clone()).or_default();
-                            *entry = std::cmp::max(*entry, message.offset);
+                        for part in timestamper.reclock_messages(&mut pending_messages).await {
+                            for (ts, msg) in part {
+                                yield Event::Message(ts, Ok(msg));
+                            };
                         }
-                        let (bindings, progress) = match timestamper.timestamp_offsets(&max_offsets).await {
-                            Ok((bindings, progress)) => (bindings, progress),
-                            Err(e) => {
-                                error!("Error timestamping offsets: {}", e);
-                                return;
-                            }
-                        };
 
-                        for msg in pending_messages.drain(..) {
-                            match msg{
-                                Ok(message) => {
-                                    let ts = bindings.get(&message.partition).expect("timestamper didn't return partition").0;
-                                    yield Event::Message(ts, Ok(message));
-                                },
-                                Err(e) => {
-                                    // TODO: make errors definite
-                                    yield Event::Message(0, Err(e));
-                                },
-                            }
+                        //TODO: make errors definite
+                        for err in non_definite_errors.drain(..) {
+                            yield Event::Message(0, Err(err));
                         }
-                        let progress_some = progress.as_option().is_some();
-                        yield Event::Progress(progress.into_option());
+
+                        if let Some(frontier) = timestamper.compact(&read_frontier) {
+                            yield Event::Progress(frontier.into_option());
+                        }
+
                         if source_stream.is_done() {
                             // We just emitted the last piece of data that needed to be timestamped
-                            if progress_some {
-                                yield Event::Progress(None);
-                            }
+                            yield Event::Progress(None);
                             break;
                         }
                     }
