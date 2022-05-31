@@ -34,10 +34,7 @@ use serde::{Deserialize, Serialize};
 use timely::order::{PartialOrder, TotalOrder};
 use timely::progress::frontier::MutableAntichain;
 use timely::progress::{Antichain, ChangeBatch, Timestamp};
-use tokio::runtime::Handle;
-use tokio::sync::mpsc::UnboundedSender;
-use tokio::task::JoinHandle;
-use tracing::{error, trace, warn};
+use tokio::sync::watch;
 use uuid::Uuid;
 
 use mz_persist_client::{
@@ -200,7 +197,7 @@ pub struct StorageControllerState<T: Timestamp + Lattice + Codec64, S = mz_stash
     pub(super) collections: BTreeMap<GlobalId, CollectionState<T>>,
     pub(super) stash: S,
     pub(super) persist_handles: BTreeMap<GlobalId, PersistHandles<T>>,
-    persist_downgrade: PersistWorker<T>,
+    persist_worker: PersistWorker<T>,
 }
 
 /// A storage controller for a storage instance.
@@ -286,13 +283,12 @@ impl<T: Timestamp + Lattice + Codec64> StorageControllerState<T> {
     pub(super) fn new(client: Box<dyn StorageClient<T>>, state_dir: PathBuf) -> Self {
         let stash = mz_stash::Sqlite::open(&state_dir.join("storage"))
             .expect("unable to create storage stash");
-        let persist_downgrade = PersistWorker::new();
         Self {
             client,
             collections: BTreeMap::default(),
             stash,
             persist_handles: BTreeMap::default(),
-            persist_downgrade,
+            persist_worker: PersistWorker::default(),
         }
     }
 }
@@ -366,7 +362,7 @@ where
             self.state
                 .persist_handles
                 .insert(id, PersistHandles { write });
-            self.state.persist_downgrade.register(persist_shard, read);
+            self.state.persist_worker.register(persist_shard, read);
 
             let timestamp_shard_id = TypedCollection::new("timestamp-shard-id")
                 .insert_without_overwrite(&mut self.state.stash, &id, ShardId::new())
@@ -557,7 +553,7 @@ where
                 compaction_commands.push((*id, frontier.clone()));
 
                 self.state
-                    .persist_downgrade
+                    .persist_worker
                     .downgrade(collection.persist_shard, frontier);
             }
         }
@@ -695,97 +691,40 @@ impl<T: Timestamp> CollectionState<T> {
 /// persist calls.
 #[derive(Debug)]
 struct PersistWorker<T: Timestamp + Lattice + Codec64> {
-    tx: UnboundedSender<PersistWorkerCmd<T>>,
-    handle: Option<JoinHandle<Result<(), anyhow::Error>>>,
+    senders: HashMap<ShardId, watch::Sender<Antichain<T>>>,
 }
 
-impl<T> Drop for PersistWorker<T>
-where
-    T: Timestamp + Lattice + Codec64,
-{
-    fn drop(&mut self) {
-        self.send(PersistWorkerCmd::Shutdown);
-
-        let handle = match Handle::try_current() {
-            Ok(x) => x,
-            Err(_) => {
-                warn!("PersistDowngrade dropped without a tokio Runtime present, cannot join on handle");
-                return;
-            }
-        };
-
-        let res = handle
-            .block_on(self.handle.take().expect("missing join handle"))
-            .expect("join error");
-
-        match res {
-            Ok(()) => (), // All good!
-            Err(e) => {
-                error!("error while shutting down PersistDowngrade: {}", e)
-            }
+impl<T: Timestamp + Lattice + Codec64> Default for PersistWorker<T> {
+    fn default() -> Self {
+        Self {
+            senders: HashMap::new(),
         }
     }
-}
-
-/// Commands for [PersistWorker].
-#[derive(Debug)]
-enum PersistWorkerCmd<T: Timestamp + Lattice + Codec64> {
-    Register(ShardId, ReadHandle<SourceData, (), T, Diff>),
-    Downgrade(ShardId, Antichain<T>),
-    Shutdown,
 }
 
 impl<T: Timestamp + Lattice + Codec64> PersistWorker<T> {
-    fn new() -> Self {
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-
-        let handle = mz_ore::task::spawn(|| "PersistDowngrade", async move {
-            let mut read_handles: HashMap<ShardId, ReadHandle<SourceData, (), T, Diff>> =
-                HashMap::new();
-
-            while let Some(cmd) = rx.recv().await {
-                match cmd {
-                    PersistWorkerCmd::Register(shard_id, read_handle) => {
-                        let previous = read_handles.insert(shard_id, read_handle);
-                        if previous.is_some() {
-                            panic!("already registered a ReadHandle for shard {:?}", shard_id);
-                        }
-                    }
-                    PersistWorkerCmd::Downgrade(shard_id, since) => {
-                        let read_handle =
-                            read_handles.get_mut(&shard_id).expect("missing ReadHandle");
-                        read_handle.downgrade_since(since).await;
-                    }
-                    PersistWorkerCmd::Shutdown => {
-                        trace!("shutting down persist since downgrade task");
-                        break;
-                    }
-                }
+    fn register(
+        &mut self,
+        shard_id: ShardId,
+        mut read_handle: ReadHandle<SourceData, (), T, Diff>,
+    ) {
+        let (tx, mut rx) = watch::channel(read_handle.since().clone());
+        // We don't want to perform a downgrade on the current since frontier so mark it as seen
+        rx.borrow_and_update();
+        mz_ore::task::spawn(|| format!("PersistDowngrade({shard_id})"), async move {
+            while rx.changed().await.is_ok() {
+                let since = rx.borrow().clone();
+                read_handle.downgrade_since(since).await;
             }
-
-            Ok(())
         });
-
-        Self {
-            tx,
-            handle: Some(handle),
-        }
-    }
-
-    fn register(&self, shard_id: ShardId, read_handle: ReadHandle<SourceData, (), T, Diff>) {
-        self.send(PersistWorkerCmd::Register(shard_id, read_handle))
+        self.senders.insert(shard_id, tx);
     }
 
     fn downgrade(&self, shard_id: ShardId, since: Antichain<T>) {
-        self.send(PersistWorkerCmd::Downgrade(shard_id, since))
-    }
-
-    fn send(&self, cmd: PersistWorkerCmd<T>) {
-        match self.tx.send(cmd) {
-            Ok(()) => (), // All good!
-            Err(e) => {
-                error!("could not forward command: {:?}", e);
-            }
-        }
+        self.senders
+            .get(&shard_id)
+            .expect("unknown shard_id")
+            .send(since)
+            .expect("task died");
     }
 }
