@@ -4230,6 +4230,7 @@ dependencies = [
  "tracing-subscriber",
  "url",
  "uuid",
+ "yoke",
 ]
 
 [[package]]
@@ -6115,9 +6116,9 @@ checksum = "20518fe4a4c9acf048008599e464deb21beeae3d3578418951a189c235a7a9a8"
 
 [[package]]
 name = "synstructure"
-version = "0.12.3"
+version = "0.12.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "67656ea1dc1b41b1451851562ea232ec2e5a80242139f7e679ceccfb5d61f545"
+checksum = "f36bdaa60a83aca3921b5259d5400cbf5e90fc51931376a9bd4a0eb79aa7210f"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -7152,6 +7153,47 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "56c1936c4cc7a1c9ab21a1ebb602eb942ba868cbd44a99cb7cdc5892335e1c85"
 dependencies = [
  "linked-hash-map",
+]
+
+[[package]]
+name = "yoke"
+version = "0.6.1"
+source = "git+https://github.com/petrosagg/icu4x.git?branch=with-mut-returns#3b047763dae115033e86cf2025f5104c4d618d05"
+dependencies = [
+ "serde",
+ "stable_deref_trait",
+ "yoke-derive",
+ "zerofrom",
+]
+
+[[package]]
+name = "yoke-derive"
+version = "0.6.1"
+source = "git+https://github.com/petrosagg/icu4x.git?branch=with-mut-returns#3b047763dae115033e86cf2025f5104c4d618d05"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
+ "synstructure",
+]
+
+[[package]]
+name = "zerofrom"
+version = "0.1.1"
+source = "git+https://github.com/petrosagg/icu4x.git?branch=with-mut-returns#3b047763dae115033e86cf2025f5104c4d618d05"
+dependencies = [
+ "zerofrom-derive",
+]
+
+[[package]]
+name = "zerofrom-derive"
+version = "0.1.1"
+source = "git+https://github.com/petrosagg/icu4x.git?branch=with-mut-returns#3b047763dae115033e86cf2025f5104c4d618d05"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
+ "synstructure",
 ]
 
 [[package]]

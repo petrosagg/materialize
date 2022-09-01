@@ -9,9 +9,11 @@
 
 //! Timestamper using persistent collection
 use std::borrow::Borrow;
+use std::cell::RefCell;
 use std::collections::hash_map::{self, HashMap};
 use std::collections::HashSet;
 use std::iter::Peekable;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -31,6 +33,7 @@ use mz_persist_client::write::WriteHandle;
 use mz_persist_client::Upper;
 use mz_repr::Timestamp;
 use tracing::trace;
+use yoke::{Yoke, Yokeable};
 
 use crate::controller::CollectionMetadata;
 use crate::types::sources::MzOffset;
@@ -39,7 +42,7 @@ use crate::types::sources::MzOffset;
 pub struct ReclockFollower {
     /// A dTVC trace of the remap collection containing all consolidated updates at
     /// `t` such that `since <= t < upper` indexed by partition and sorted by time.
-    remap_trace: HashMap<PartitionId, Vec<(Timestamp, MzOffset)>>,
+    remap_trace: Rc<RefCell<HashMap<PartitionId, Vec<(Timestamp, MzOffset)>>>>,
     /// Since frontier of the partial remap trace
     since: Antichain<Timestamp>,
     /// Upper frontier of the partial remap trace
@@ -53,7 +56,7 @@ impl ReclockFollower {
     /// Construct a new [ReclockOperator] from the given collection metadata
     pub fn new(as_of: Antichain<Timestamp>) -> Self {
         Self {
-            remap_trace: HashMap::new(),
+            remap_trace: Default::default(),
             since: as_of,
             upper: Antichain::from_elem(Timestamp::minimum()),
             source_upper: HashMap::new(),
@@ -65,9 +68,10 @@ impl ReclockFollower {
         &mut self,
         updates: impl IntoIterator<Item = (PartitionId, Vec<(Timestamp, MzOffset)>)>,
     ) {
+        let mut remap_trace = self.remap_trace.borrow_mut();
         for (pid, updates) in updates {
             for (ts, diff) in updates {
-                let bindings = self.remap_trace.entry(pid.clone()).or_default();
+                let bindings = remap_trace.entry(pid.clone()).or_default();
                 bindings.push((ts, diff));
 
                 *self.source_upper.entry(pid.clone()).or_default() += diff;
@@ -186,8 +190,8 @@ impl ReclockFollower {
             // If we have compacted there are two posibilities. Either the since frontier is at
             // exactly the time of the first binding (and will continue to do so since times are
             // advanced during compaction), or it is behind it.
-            let (first_ts, first_offset) = self
-                .remap_trace
+            let remap_trace = RefCell::borrow(&*self.remap_trace);
+            let (first_ts, first_offset) = remap_trace
                 .get(pid)
                 .and_then(|b| b.first())
                 .copied()
@@ -206,10 +210,14 @@ impl ReclockFollower {
 
     /// Returns an iterator of timestamp bindings for a given partition
     fn partition_bindings(&self, pid: &PartitionId) -> PartitionBindings {
-        let bindings = match self.remap_trace.get(pid) {
-            Some(bindings) => (*bindings).iter(),
-            None => (&[]).iter(),
-        };
+        let remap_trace = RefCell::borrow(&*self.remap_trace);
+        let bindings = Yoke::attach_to_cart(remap_trace, |remap_trace| {
+            let iter = match remap_trace.get(pid) {
+                Some(bindings) => (*bindings).iter(),
+                None => (&[]).iter(),
+            };
+            YokeIter(iter)
+        });
         PartitionBindings {
             offset: MzOffset::default(),
             bindings,
@@ -220,7 +228,8 @@ impl ReclockFollower {
     #[allow(dead_code)]
     pub async fn compact(&mut self, new_since: Antichain<Timestamp>) {
         assert!(PartialOrder::less_equal(&self.since, &new_since));
-        for bindings in self.remap_trace.values_mut() {
+        let mut remap_trace = self.remap_trace.borrow_mut();
+        for bindings in remap_trace.values_mut() {
             // Compact the remap trace according to the computed frontier
             for (timestamp, _) in bindings.iter_mut() {
                 timestamp.advance_by(new_since.borrow());
@@ -240,7 +249,7 @@ impl ReclockFollower {
 pub struct ReclockOperator {
     /// A dTVC trace of the remap collection containing all consolidated updates at
     /// `t` such that `since <= t < upper` indexed by partition and sorted by time.
-    remap_trace: HashMap<PartitionId, Vec<(Timestamp, MzOffset)>>,
+    remap_trace: Rc<RefCell<HashMap<PartitionId, Vec<(Timestamp, MzOffset)>>>>,
     /// Since frontier of the partial remap trace
     since: Antichain<Timestamp>,
     /// Upper frontier of the partial remap trace
@@ -305,7 +314,7 @@ impl ReclockOperator {
             .expect("since <= as_of asserted");
 
         let mut operator = Self {
-            remap_trace: HashMap::new(),
+            remap_trace: Default::default(),
             since: as_of.clone(),
             upper: Antichain::from_elem(Timestamp::minimum()),
             source_upper: HashMap::new(),
@@ -372,7 +381,8 @@ impl ReclockOperator {
     #[allow(dead_code)]
     pub async fn compact(&mut self, new_since: Antichain<Timestamp>) {
         assert!(PartialOrder::less_equal(&self.since, &new_since));
-        for bindings in self.remap_trace.values_mut() {
+        let mut remap_trace = self.remap_trace.borrow_mut();
+        for bindings in remap_trace.values_mut() {
             // Compact the remap trace according to the computed frontier
             for (timestamp, _) in bindings.iter_mut() {
                 timestamp.advance_by(new_since.borrow());
@@ -397,7 +407,8 @@ impl ReclockOperator {
     /// Calculates the source upper frontier at a particular timestamp
     pub fn source_upper_at(&self, target: Timestamp) -> HashMap<PartitionId, MzOffset> {
         let mut source_upper = HashMap::new();
-        for pid in self.remap_trace.keys() {
+        let remap_trace = RefCell::borrow(&*self.remap_trace);
+        for pid in remap_trace.keys() {
             let binding = self
                 .partition_bindings(pid)
                 .take_while(|(ts, _)| ts <= &target)
@@ -436,12 +447,13 @@ impl ReclockOperator {
         // Tail the listen stream until we reach the target upper frontier. Note that, in the
         // common case, we are also the writer, so we are waiting to read-back what we wrote
         while PartialOrder::less_than(&self.upper, target_upper) {
+            let mut remap_trace = self.remap_trace.borrow_mut();
             for event in self.listener.next().await {
                 match event {
                     ListenEvent::Progress(new_upper) => {
                         consolidation::consolidate_updates(&mut pending_batch);
                         for (pid, ts, diff) in pending_batch.drain(..) {
-                            let bindings = self.remap_trace.entry(pid.clone()).or_default();
+                            let bindings = remap_trace.entry(pid.clone()).or_default();
                             bindings.push((ts, diff));
 
                             // Record all updates for returning.
@@ -468,7 +480,8 @@ impl ReclockOperator {
     /// Returns the current contents of the remap trace. Suitable for
     /// bootstrapping a `ReclockListener`.
     pub fn remap_trace(&self) -> HashMap<PartitionId, Vec<(Timestamp, MzOffset)>> {
-        self.remap_trace.clone()
+        let remap_trace = RefCell::borrow(&*self.remap_trace);
+        remap_trace.clone()
     }
 
     /// Ensures that the persist shard backing this reclock operator contains bindings that cover
@@ -597,10 +610,14 @@ impl ReclockOperator {
 
     /// Returns an iterator of timestamp bindings for a given partition
     fn partition_bindings(&self, pid: &PartitionId) -> PartitionBindings {
-        let bindings = match self.remap_trace.get(pid) {
-            Some(bindings) => (*bindings).iter(),
-            None => (&[]).iter(),
-        };
+        let remap_trace = RefCell::borrow(&*self.remap_trace);
+        let bindings = Yoke::attach_to_cart(remap_trace, |remap_trace| {
+            let iter = match remap_trace.get(pid) {
+                Some(bindings) => (*bindings).iter(),
+                None => (&[]).iter(),
+            };
+            YokeIter(iter)
+        });
         PartitionBindings {
             offset: MzOffset::default(),
             bindings,
@@ -617,8 +634,8 @@ impl ReclockOperator {
             // If we have compacted there are two posibilities. Either the since frontier is at
             // exactly the time of the first binding (and will continue to do so since times are
             // advanced during compaction), or it is behind it.
-            let (first_ts, first_offset) = self
-                .remap_trace
+            let remap_trace = RefCell::borrow(&*self.remap_trace);
+            let (first_ts, first_offset) = remap_trace
                 .get(pid)
                 .and_then(|b| b.first())
                 .copied()
@@ -636,16 +653,23 @@ impl ReclockOperator {
     }
 }
 
+/// Just a new type to get around orphan rules
+#[derive(Yokeable)]
+struct YokeIter<'a, D>(std::slice::Iter<'a, D>);
+
 /// The Iterator returned by [ReclockOperator::partition_bindings]
 struct PartitionBindings<'a> {
     offset: MzOffset,
-    bindings: std::slice::Iter<'a, (Timestamp, MzOffset)>,
+    bindings: Yoke<
+        YokeIter<'static, (Timestamp, MzOffset)>,
+        std::cell::Ref<'a, HashMap<PartitionId, Vec<(Timestamp, MzOffset)>>>,
+    >,
 }
 
 impl Iterator for PartitionBindings<'_> {
     type Item = (Timestamp, MzOffset);
     fn next(&mut self) -> Option<Self::Item> {
-        let &(ts, diff) = self.bindings.next()?;
+        let &(ts, diff) = self.bindings.with_mut(|bindings| bindings.0.next())?;
         self.offset += diff;
         Some((ts, self.offset))
     }
