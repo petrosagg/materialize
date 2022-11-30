@@ -109,8 +109,10 @@ information, progress. Our association of `FromTime` to `IntoTime` must be done 
 know when there will be no more events mapped to some particular `into_ts`, meaning that this
 timestamp is no longer in progress.
 
-Informally what we want to do is look at our real time clock and at the same time look at the
-current maximum offset present in the source. We now have an association of a real time timestamp
+Informally what we want to do is look at our real time clock and at the same time figure out what
+is the **next** offset that this source will emit. The
+
+. We now have an association of a real time timestamp
 and an upper bound on the offsets that exist in the source which we will proceed and write down
 durably. Materialize already has an abstraction for recording values that change over time, the
 differential collection!
@@ -129,19 +131,19 @@ differential collection!
 > collect all the changes that happened at times less than or equal to t.
 
 With the definition of a differential collection in our mind, let's walk through an example.
-Suppose we check for offsets at 1pm, 2pm and 3pm and the kafka offsets are 100, 150, and 300
+Suppose we check for offsets at 1pm, 2pm and 3pm and the kafka offsets are 1, 4, and 6
 respectively. Using these observations we can generate a differential collection that looks like
 this:
 
 
 ```
-(100, 1pm, +1)
+(1, 1pm, +1)
 
-(100, 2pm, -1)
-(150, 2pm, +1)
+(1, 2pm, -1)
+(4, 2pm, +1)
 
-(150, 3pm, -1)
-(300, 3pm, +1)
+(4, 3pm, -1)
+(6, 3pm, +1)
 ```
 
 Way we can easily explore the contents of this collection via SQL. Here's what this would look
@@ -152,21 +154,33 @@ like:
 > SELECT * FROM topic_a_progress AS OF 2pm
 offset
 ------
-150
+4
 
 > SELECT * FROM topic_b_progress AS OF 3pm
 offset
 ------
-300
+6
 ```
 
-This is great! What the results above tell us is that at `2pm` our kafka source offset was 150 and
-that at `3pm` it became 300. We have a produced and durably recorded a description of the
-previously implicit association of the real time with the progression of offsets in a topic. What's
-left to figure out is how to use this information to translate event timestamps and progress
-statements from the offset domain to the real time domain.
+This is great! What the results above tell us is that at `2pm` our kafka source offset was 4 and
+that at `3pm` it became 6. We have a produced and durably recorded a description of the previously
+implicit association of the real time with the progression of offsets in a topic. What's left to
+figure out is how to use this information to translate event timestamps and progress statements
+from the offset domain to the real time domain.
 
 
+Specifically, we want to take the differential collection of the source data and assign a new
+timestamp for each change:
+
+```
+
+
+```
+
+
+
+
+Using this information we can start to see how
 
 
 
