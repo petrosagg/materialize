@@ -95,10 +95,11 @@ preserves the correctness properties that we laid out in the beginning? Enter re
 
 ## Reclocking a stream
 
-Reclocking a method for translating the events of a stream from one gauge of progress (read:
-timestamp) to another. In Materialize we employ reclocking to translate from the native way a
-particular source of data describes progress (e.g Kafka offsets, Postgres LSNs) into a common
-timeline of milliseconds since the unix epoch.
+Reclocking is a method that allows us to capture this correspondence of real time to source
+offsets. More formally, it is a method for translating the events of a stream from one gauge of
+progress (read: timestamp) to another. In Materialize we employ reclocking to translate from the
+native way a particular source of data describes progress (e.g Kafka offsets, Postgres LSNs) into a
+common timeline of milliseconds since the unix epoch.
 
 Let's name the timestamp of the stream to be reclocked `FromTime` and the timestamp we want to
 reclock into `IntoTime`. The goal is then is come up with a way to associate each `from_ts`
@@ -112,9 +113,25 @@ Informally what we want to do is look at our real time clock and at the same tim
 current maximum offset present in the source. We now have an association of a real time timestamp
 and an upper bound on the offsets that exist in the source which we will proceed and write down
 durably. Materialize already has an abstraction for recording values that change over time, the
-differential collection! Let's walk through an example. Suppose we check for offsets at 1pm, 2pm
-and 3pm and the kafka offsets are 100, 150, and 300 respectively. Using these observations we can
-generate a differential collection that looks like this:
+differential collection!
+
+> #### Quick note on dfferential collections
+>
+> A differential collection is the way Materialize represents any relational object like tables,
+> sources, views, etc. These collections are able to capture not just the contents of the collection
+> at a single time, but the full evolution of a collection as it changes. It achieves this by
+> recording changes that happen at a particular time. Each change looks like a triplet of `(data,
+> time, diff)` where `data` can be thought of as a row in a table, `time` is the timestamp at which
+> this change happened, and `diff` is a positive or negative integer that indicates how many copies
+> of this row were inserted or deleted at this particular time.
+>
+> If we want to discover the contents of a table at a particular time `t` all we need to do is
+> collect all the changes that happened at times less than or equal to t.
+
+With the definition of a differential collection in our mind, let's walk through an example.
+Suppose we check for offsets at 1pm, 2pm and 3pm and the kafka offsets are 100, 150, and 300
+respectively. Using these observations we can generate a differential collection that looks like
+this:
 
 
 ```
@@ -127,9 +144,8 @@ generate a differential collection that looks like this:
 (300, 3pm, +1)
 ```
 
-This is exactly the representation that materialize uses for normal tables and so by writing things
-down this way we can easily explore the contents of this collection via SQL. Here's what this would
-look like:
+Way we can easily explore the contents of this collection via SQL. Here's what this would look
+like:
 
 
 ```sql
@@ -144,10 +160,17 @@ offset
 300
 ```
 
-This is great! We have a produced and durably recorded a description of the previously implicit
-association of the real time with the progression of offsets in a topic. What's left to figure out
-is how to use this information to transalate event timestamps and progress statements from the
-offset domain to the real time domain. Here is the rule we'll follow:
+This is great! What the results above tell us is that at `2pm` our kafka source offset was 150 and
+that at `3pm` it became 300. We have a produced and durably recorded a description of the
+previously implicit association of the real time with the progression of offsets in a topic. What's
+left to figure out is how to use this information to translate event timestamps and progress
+statements from the offset domain to the real time domain.
+
+
+
+
+
+Here is the rule we'll follow:
 
 For every association between offset X and time T that we write down.
 
