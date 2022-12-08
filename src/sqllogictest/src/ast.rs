@@ -142,6 +142,8 @@ pub enum Record<'a> {
         table_name: &'a str,
         tsv_path: &'a str,
     },
+    /// A `restart-server` directive
+    RestartServer,
 }
 
 /// Specifies the dialect of a sqllogictest file. Different sqllogictest runners

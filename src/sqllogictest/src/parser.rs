@@ -143,6 +143,8 @@ impl<'a> Parser<'a> {
                     .ok_or_else(|| anyhow!("load directive missing TSV path"))?,
             }),
 
+            "restart-server" => Ok(Record::RestartServer),
+
             other => bail!("Unexpected start of record: {}", other),
         }
     }
