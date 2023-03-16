@@ -1044,7 +1044,7 @@ checksum = "baf1de4339761588bc0619e3cbc0120ee582ebb74b53b4efbf79117bd2da40fd"
 [[package]]
 name = "chrono"
 version = "0.4.24"
-source = "git+https://github.com/chronotope/chrono.git?branch=0.4.x#daa86a77d36d74f474913fd3b560a40f1424bd77"
+source = "git+https://github.com/chronotope/chrono.git?branch=0.4.x#dc9ea3ab455bf705df7711a0bbdd73e4b7eadc12"
 dependencies = [
  "iana-time-zone",
  "num-integer",
@@ -4874,6 +4874,7 @@ dependencies = [
  "protobuf-src",
  "rand",
  "rdkafka",
+ "ref-cast",
  "regex",
  "serde",
  "serde_json",
@@ -4937,6 +4938,7 @@ dependencies = [
  "prost-build",
  "protobuf-src",
  "rdkafka",
+ "ref-cast",
  "regex",
  "serde",
  "thiserror",
@@ -6261,6 +6263,26 @@ checksum = "528532f3d801c87aec9def2add9ca802fe569e44a544afe633765267840abe64"
 dependencies = [
  "getrandom",
  "redox_syscall",
+]
+
+[[package]]
+name = "ref-cast"
+version = "1.0.15"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a9af2cf09ef80e610097515e80095b7f76660a92743c4185aff5406cd5ce3dd5"
+dependencies = [
+ "ref-cast-impl",
+]
+
+[[package]]
+name = "ref-cast-impl"
+version = "1.0.15"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9c501201393982e275433bc55de7d6ae6f00e7699cd5572c5b57581cd69c881b"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
 ]
 
 [[package]]

@@ -2700,8 +2700,16 @@ impl RustType<ProtoS3KeySource> for S3KeySource {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, ref_cast::RefCast)]
+#[repr(transparent)]
 pub struct SourceData(pub Result<Row, DataflowError>);
+
+impl SourceData {
+    pub fn from_ref<'a>(inner: &'a Result<Row, DataflowError>) -> &'a Self {
+        // SAFETY: this is a repr(transparent) wrapper so the refererences are equivalent
+        unsafe { std::mem::transmute::<&'a Result<Row, DataflowError>, &'a Self>(inner) }
+    }
+}
 
 impl Deref for SourceData {
     type Target = Result<Row, DataflowError>;
