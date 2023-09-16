@@ -242,6 +242,13 @@ impl Connection<InlinedConnection> {
             o => unreachable!("{o:?} is not an SSH connection"),
         }
     }
+
+    pub fn unwrap_aws(self) -> <InlinedConnection as ConnectionAccess>::Aws {
+        match self {
+            Self::Aws(conn) => conn,
+            o => unreachable!("{o:?} is not a Kinesis connection"),
+        }
+    }
 }
 
 #[derive(Arbitrary, Clone, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]

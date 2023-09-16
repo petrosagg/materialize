@@ -1043,6 +1043,11 @@ impl_display_t!(PgConfigOption);
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum CreateSourceConnection<T: AstInfo> {
     Kafka(KafkaSourceConnection<T>),
+    Kinesis {
+        /// The AWS connection.
+        connection: T::ItemName,
+        arn: String,
+    },
     Postgres {
         /// The postgres connection.
         connection: T::ItemName,
@@ -1068,6 +1073,13 @@ impl<T: AstInfo> AstDisplay for CreateSourceConnection<T> {
                     f.write_node(&display::comma_separated(key));
                     f.write_str(")");
                 }
+            }
+            CreateSourceConnection::Kinesis { connection, arn } => {
+                f.write_str("KINESIS CONNECTION ");
+                f.write_node(connection);
+                f.write_str(" ARN '");
+                f.write_node(&display::escape_single_quote_string(arn));
+                f.write_str("'");
             }
             CreateSourceConnection::Postgres {
                 connection,

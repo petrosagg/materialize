@@ -16,6 +16,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write;
 use std::iter;
 
+use aws_arn::ResourceName as AmazonResourceName;
 use itertools::Itertools;
 use mz_controller_types::{ClusterId, ReplicaId, DEFAULT_REPLICA_LOGGING_INTERVAL_MICROS};
 use mz_expr::CollectionPlan;
@@ -55,8 +56,9 @@ use mz_storage_types::sources::encoding::{
     ProtobufEncoding, RegexEncoding, SourceDataEncoding, SourceDataEncodingInner,
 };
 use mz_storage_types::sources::{
-    GenericSourceConnection, IncludedColumnPos, KafkaSourceConnection, KeyEnvelope, LoadGenerator,
-    LoadGeneratorSourceConnection, PostgresSourceConnection, PostgresSourcePublicationDetails,
+    GenericSourceConnection, IncludedColumnPos, KafkaSourceConnection, KeyEnvelope,
+    KinesisSourceConnection, LoadGenerator, LoadGeneratorSourceConnection,
+    PostgresSourceConnection, PostgresSourcePublicationDetails,
     ProtoPostgresSourcePublicationDetails, SourceConnection, SourceDesc, SourceEnvelope,
     TestScriptSourceConnection, Timeline, UnplannedSourceEnvelope, UpsertStyle,
 };
@@ -734,6 +736,36 @@ pub fn plan_create_source(
             }
 
             let connection = GenericSourceConnection::Kafka(connection);
+
+            (connection, encoding, None)
+        }
+        CreateSourceConnection::Kinesis {
+            connection: aws_connection,
+            arn,
+        } => {
+            // XXX: add feature flag
+            let arn: AmazonResourceName = arn
+                .parse()
+                .map_err(|e| sql_err!("Unable to parse provided ARN: {:#?}", e))?;
+            let stream_name = match arn.resource.strip_prefix("stream/") {
+                Some(path) => path.to_owned(),
+                _ => sql_bail!(
+                    "Unable to parse stream name from resource path: {}",
+                    arn.resource
+                ),
+            };
+
+            let encoding = get_encoding(scx, format, &envelope, Some(connection))?;
+
+            let connection_item = scx.get_item_by_resolved_name(aws_connection)?;
+
+            let connection = KinesisSourceConnection::<ReferencedConnection> {
+                connection_id: connection_item.id(),
+                connection: connection_item.id(),
+                stream_name,
+            };
+
+            let connection = GenericSourceConnection::Kinesis(connection);
 
             (connection, encoding, None)
         }

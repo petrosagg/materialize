@@ -26,6 +26,24 @@ use mz_ore::stats::histogram_seconds_buckets;
 use mz_repr::GlobalId;
 use prometheus::core::{AtomicI64, GenericCounterVec};
 
+/// The base metrics set for the kinesis module.
+#[derive(Clone, Debug)]
+pub(crate) struct KinesisMetrics {
+    pub(crate) millis_behind_latest: IntGaugeVec,
+}
+
+impl KinesisMetrics {
+    fn register_with(registry: &MetricsRegistry) -> Self {
+        Self {
+            millis_behind_latest: registry.register(metric!(
+                name: "mz_kinesis_shard_millis_behind_latest",
+                help: "How far the shard is behind the tip of the stream",
+                var_labels: ["stream_name", "shard_id"],
+            )),
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(super) struct SourceSpecificMetrics {
     pub(super) capability: UIntGaugeVec,
@@ -542,6 +560,8 @@ pub struct SourceBaseMetrics {
     pub(super) upsert_specific: UpsertMetrics,
     pub(crate) upsert_backpressure_specific: UpsertBackpressureMetrics,
 
+    pub(crate) kinesis: KinesisMetrics,
+
     pub(crate) bytes_read: IntCounter,
 
     /// Metrics that are also exposed to users.
@@ -555,6 +575,7 @@ impl SourceBaseMetrics {
             source_specific: SourceSpecificMetrics::register_with(registry),
             partition_specific: PartitionSpecificMetrics::register_with(registry),
             postgres_source_specific: PostgresSourceSpecificMetrics::register_with(registry),
+            kinesis: KinesisMetrics::register_with(registry),
 
             upsert_specific: UpsertMetrics::register_with(registry),
             upsert_backpressure_specific: UpsertBackpressureMetrics::register_with(registry),

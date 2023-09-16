@@ -13,6 +13,7 @@ async-trait = "0.1.68"
 atty = "0.2.0"
 aws-config = { version = "0.55", default-features = false, features = ["native-tls"] }
 aws-credential-types = { version = "0.55", features = ["hardcoded-credentials"] }
+aws-sdk-kinesis = { version = "0.26", default-features = false, features = ["native-tls", "rt-tokio"] }
 aws-sdk-sts = { version = "0.26", default-features = false, features = ["native-tls", "rt-tokio"] }
 aws-types = "0.55"
 byteorder = "1.4.3"
@@ -38,6 +39,7 @@ mz-adapter = { path = "../adapter" }
 mz-expr = { path = "../expr" }
 mz-interchange = { path = "../interchange" }
 mz-kafka-util = { path = "../kafka-util" }
+mz-kinesis-util = { path = "../kinesis-util" }
 mz-ore = { path = "../ore", features = ["async"] }
 mz-pgrepr = { path = "../pgrepr" }
 mz-postgres-util = { path = "../postgres-util" }

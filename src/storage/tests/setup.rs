@@ -282,6 +282,7 @@ where
                     match &desc.connection {
                         GenericSourceConnection::Kafka(c) => minimum_frontier(c),
                         GenericSourceConnection::Postgres(c) => minimum_frontier(c),
+                        GenericSourceConnection::Kinesis(c) => minimum_frontier(c),
                         GenericSourceConnection::TestScript(c) => minimum_frontier(c),
                         GenericSourceConnection::LoadGenerator(c) => minimum_frontier(c),
                     },

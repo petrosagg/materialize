@@ -27,7 +27,7 @@ use mz_repr::{Diff, GlobalId, Row};
 use mz_service::local::Activatable;
 use mz_storage_types::controller::CollectionMetadata;
 use mz_storage_types::sources::{
-    GenericSourceConnection, IngestionDescription, KafkaSourceConnection,
+    GenericSourceConnection, IngestionDescription, KafkaSourceConnection, KinesisSourceConnection,
     LoadGeneratorSourceConnection, PostgresSourceConnection, SourceConnection, SourceData,
     SourceEnvelope, SourceTimestamp, TestScriptSourceConnection,
 };
@@ -333,6 +333,17 @@ impl<T: Timestamp + Lattice + Codec64 + Display> AsyncStorageWorker<T> {
                         let source_resume_uppers = match ingestion_description.desc.connection {
                             GenericSourceConnection::Kafka(_) => {
                                 let uppers = reclock_resume_uppers::<KafkaSourceConnection, _>(
+                                    &id,
+                                    &persist_clients,
+                                    &ingestion_description,
+                                    as_of.clone(),
+                                    &resume_uppers,
+                                )
+                                .await;
+                                to_vec_row(uppers)
+                            }
+                            GenericSourceConnection::Kinesis(_) => {
+                                let uppers = reclock_resume_uppers::<KinesisSourceConnection, _>(
                                     &id,
                                     &persist_clients,
                                     &ingestion_description,

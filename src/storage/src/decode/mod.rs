@@ -10,7 +10,7 @@
 //! This module provides functions that
 //! build decoding pipelines from raw source streams.
 //!
-//! The primary exports are [`render_decode_delimited`], and
+//! The primary exports are [`render_decode`], [`render_decode_delimited`], and
 //! [`render_decode_cdcv2`]. See their docs for more details about their differences.
 
 use std::any::Any;

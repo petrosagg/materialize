@@ -194,6 +194,18 @@ pub(crate) async fn run_line_reader(
     }
 
     if config.reset {
+        // Clean up AWS state at the end of the run. Unlike Materialize and
+        // Kafka state, leaving around AWS resources costs real money. We
+        // intentionally don't stop at the first error because we don't want
+        // to e.g. skip cleaning up SQS resources because we failed to clean up
+        // S3 resources.
+
+        let mut reset_errors = vec![];
+
+        if let Err(e) = state.reset_kinesis().await {
+            reset_errors.push(e);
+        }
+
         drop(state);
         if let Err(e) = state_cleanup.await {
             errors.push(anyhow!("cleanup failed: error: {}", e.to_string_with_causes()).into());

@@ -3031,7 +3031,7 @@ impl<'a> Parser<'a> {
     fn parse_create_source_connection(
         &mut self,
     ) -> Result<CreateSourceConnection<Raw>, ParserError> {
-        match self.expect_one_of_keywords(&[KAFKA, POSTGRES, LOAD, TEST])? {
+        match self.expect_one_of_keywords(&[KAFKA, KINESIS, POSTGRES, LOAD, TEST])? {
             POSTGRES => {
                 self.expect_keyword(CONNECTION)?;
                 let connection = self.parse_raw_name()?;
@@ -3067,6 +3067,14 @@ impl<'a> Parser<'a> {
                     connection,
                     key,
                 }))
+            }
+            KINESIS => {
+                self.expect_keyword(CONNECTION)?;
+                let connection = self.parse_raw_name()?;
+
+                self.expect_keyword(ARN)?;
+                let arn = self.parse_literal_string()?;
+                Ok(CreateSourceConnection::Kinesis { connection, arn })
             }
             LOAD => {
                 self.expect_keyword(GENERATOR)?;

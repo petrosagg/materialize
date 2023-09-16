@@ -163,6 +163,21 @@ pub fn render_source<'g, G: Scope<Timestamp = ()>>(
                 .collect();
             (streams, health, cap)
         }
+        GenericSourceConnection::Kinesis(connection) => {
+            let (streams, health, cap) = source::create_raw_source(
+                scope,
+                resume_stream,
+                base_source_config.clone(),
+                connection,
+                storage_state.connection_context.clone(),
+                start_signal,
+            );
+            let streams: Vec<_> = streams
+                .into_iter()
+                .map(|(ok, err)| (SourceType::Delimited(ok), err))
+                .collect();
+            (streams, health, cap)
+        }
         GenericSourceConnection::Postgres(connection) => {
             let (streams, health, cap) = source::create_raw_source(
                 scope,

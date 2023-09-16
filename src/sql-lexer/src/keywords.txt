@@ -195,6 +195,7 @@ Json
 Kafka
 Key
 Keys
+Kinesis
 Last
 Lateral
 Latest

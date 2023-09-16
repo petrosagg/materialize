@@ -17,6 +17,7 @@ use std::{env, fs};
 use anyhow::{anyhow, bail, Context};
 use async_trait::async_trait;
 use aws_credential_types::provider::ProvideCredentials;
+use aws_sdk_kinesis::Client as KinesisClient;
 use aws_types::SdkConfig;
 use futures::future::FutureExt;
 use itertools::Itertools;
@@ -48,6 +49,7 @@ use crate::util::postgres::postgres_client;
 mod file;
 mod http;
 mod kafka;
+mod kinesis;
 mod mysql;
 mod postgres;
 mod protobuf;
@@ -183,6 +185,8 @@ pub struct State {
     // === AWS state. ===
     aws_account: String,
     aws_config: SdkConfig,
+    kinesis_client: KinesisClient,
+    kinesis_stream_names: Vec<String>,
 
     // === Database driver state. ===
     mysql_clients: BTreeMap<String, mysql_async::Conn>,
@@ -477,6 +481,42 @@ impl State {
             );
         }
     }
+
+    /// Delete the Kinesis streams created for this run of testdrive.
+    pub async fn reset_kinesis(&mut self) -> Result<(), anyhow::Error> {
+        if self.kinesis_stream_names.is_empty() {
+            return Ok(());
+        }
+
+        let mut errors: Vec<anyhow::Error> = Vec::new();
+
+        for stream_name in &self.kinesis_stream_names {
+            if let Err(e) = self
+                .kinesis_client
+                .delete_stream()
+                .enforce_consumer_deletion(true)
+                .stream_name(stream_name)
+                .send()
+                .await
+                .context(format!("deleting Kinesis stream: {}", stream_name))
+            {
+                errors.push(e);
+            }
+        }
+
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            bail!(
+                "deleting Kinesis streams: {} errors: {}",
+                errors.len(),
+                errors
+                    .into_iter()
+                    .map(|e| e.to_string_with_causes())
+                    .join("\n")
+            );
+        }
+    }
 }
 
 pub enum ControlFlow {
@@ -540,6 +580,10 @@ impl Run for PosCommand {
                     "kafka-ingest" => kafka::run_ingest(builtin, state).await,
                     "kafka-verify-data" => kafka::run_verify_data(builtin, state).await,
                     "kafka-verify-commit" => kafka::run_verify_commit(builtin, state).await,
+                    "kinesis-create-stream" => kinesis::run_create_stream(builtin, state).await,
+                    "kinesis-update-shards" => kinesis::run_update_shards(builtin, state).await,
+                    "kinesis-ingest" => kinesis::run_ingest(builtin, state).await,
+                    "kinesis-verify" => kinesis::run_verify(builtin, state).await,
                     "mysql-connect" => mysql::run_connect(builtin, state).await,
                     "mysql-execute" => mysql::run_execute(builtin, state).await,
                     "postgres-connect" => postgres::run_connect(builtin, state).await,
@@ -812,6 +856,8 @@ pub async fn create_state(
         )
     };
 
+    let kinesis_client = aws_sdk_kinesis::Client::new(&config.aws_config);
+
     let mut state = State {
         // === Testdrive state. ===
         arg_vars: config.arg_vars.clone(),
@@ -851,6 +897,8 @@ pub async fn create_state(
         // === AWS state. ===
         aws_account: config.aws_account.clone(),
         aws_config: config.aws_config.clone(),
+        kinesis_client,
+        kinesis_stream_names: Vec::new(),
 
         // === Database driver state. ===
         mysql_clients: BTreeMap::new(),

@@ -16,13 +16,15 @@ use std::iter;
 use std::path::Path;
 use std::sync::Arc;
 
-use anyhow::anyhow;
+use anyhow::{anyhow, Context};
 use mz_ccsr::{Client, GetByIdError, GetBySubjectError, Schema as CcsrSchema};
+use mz_cloud_resources::AwsExternalIdPrefix;
 use mz_kafka_util::client::MzClientContext;
 use mz_ore::error::ErrorExt;
 use mz_ore::str::StrExt;
 use mz_proto::RustType;
 use mz_repr::{strconv, GlobalId};
+use mz_secrets::SecretsReader;
 use mz_sql_parser::ast::display::AstDisplay;
 use mz_sql_parser::ast::{
     AlterSourceAction, AlterSourceAddSubsourceOptionName, AlterSourceStatement,
@@ -31,6 +33,7 @@ use mz_sql_parser::ast::{
     KafkaConfigOptionName, KafkaConnection, KafkaSourceConnection, PgConfigOption,
     PgConfigOptionName, RawItemName, ReaderSchemaSelectionStrategy, Statement, UnresolvedItemName,
 };
+use mz_storage_types::connections::aws::AwsConfig;
 use mz_storage_types::connections::inline::IntoInlineConnection;
 use mz_storage_types::connections::{Connection, ConnectionContext};
 use mz_storage_types::sources::{
@@ -196,6 +199,7 @@ async fn purify_create_source(
     let progress_desc = match &connection {
         CreateSourceConnection::Kafka(_) => &mz_storage_types::sources::KAFKA_PROGRESS_DESC,
         CreateSourceConnection::Postgres { .. } => &mz_storage_types::sources::PG_PROGRESS_DESC,
+        CreateSourceConnection::Kinesis { .. } => &mz_storage_types::sources::KINESIS_PROGRESS_DESC,
         CreateSourceConnection::LoadGenerator { .. } => {
             &mz_storage_types::sources::LOAD_GEN_PROGRESS_DESC
         }
@@ -205,7 +209,9 @@ async fn purify_create_source(
     };
 
     match &connection {
-        CreateSourceConnection::Kafka(_) | CreateSourceConnection::TestScript { .. } => {
+        CreateSourceConnection::Kafka(_)
+        | CreateSourceConnection::Kinesis { .. }
+        | CreateSourceConnection::TestScript { .. } => {
             if let Some(referenced_subsources) = &referenced_subsources {
                 sql_bail!(
                     "{} is only valid for multi-output sources",
@@ -307,6 +313,25 @@ async fn purify_create_source(
         }
         CreateSourceConnection::TestScript { desc_json: _ } => {
             // TODO: verify valid json and valid schema
+        }
+        CreateSourceConnection::Kinesis { connection, .. } => {
+            let scx = StatementContext::new(None, &catalog);
+            let aws = {
+                let item = scx.get_item_by_resolved_name(connection)?;
+                match item.connection()? {
+                    Connection::Aws(aws) => aws.clone(),
+                    _ => sql_bail!(
+                        "{} is not an AWS connection",
+                        scx.catalog.resolve_full_name(item.name())
+                    ),
+                }
+            };
+            validate_aws_credentials(
+                &aws,
+                connection_context.aws_external_id_prefix.as_ref(),
+                &*connection_context.secrets_reader,
+            )
+            .await?;
         }
         CreateSourceConnection::Postgres {
             connection,
@@ -1120,4 +1145,21 @@ async fn compile_proto(
         schema,
         message_name,
     })
+}
+
+/// Makes an always-valid AWS API call to perform a basic sanity check of
+/// whether the specified AWS configuration is valid.
+async fn validate_aws_credentials(
+    config: &AwsConfig,
+    external_id_prefix: Option<&AwsExternalIdPrefix>,
+    secrets_reader: &dyn SecretsReader,
+) -> Result<(), PlanError> {
+    let config = config.load(external_id_prefix, None, secrets_reader).await;
+    let sts_client = aws_sdk_sts::Client::new(&config);
+    let _ = sts_client
+        .get_caller_identity()
+        .send()
+        .await
+        .context("Unable to validate AWS credentials")?;
+    Ok(())
 }

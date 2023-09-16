@@ -1830,7 +1830,9 @@ impl<C: ConnectionAccess> SourceDesc<C> {
                 envelope:
                     SourceEnvelope::Debezium(_) | SourceEnvelope::Upsert(_) | SourceEnvelope::CdcV2,
                 connection:
-                    GenericSourceConnection::Kafka(_) | GenericSourceConnection::TestScript(_),
+                    GenericSourceConnection::Kafka(_)
+                    | GenericSourceConnection::Kinesis(_)
+                    | GenericSourceConnection::TestScript(_),
                 ..
             } => false,
         }
@@ -1884,6 +1886,7 @@ impl<C: ConnectionAccess> SourceDesc<C> {
 pub enum GenericSourceConnection<C: ConnectionAccess = InlinedConnection> {
     Kafka(KafkaSourceConnection<C>),
     Postgres(PostgresSourceConnection<C>),
+    Kinesis(KinesisSourceConnection<C>),
     LoadGenerator(LoadGeneratorSourceConnection),
     TestScript(TestScriptSourceConnection),
 }
@@ -1897,6 +1900,12 @@ impl<C: ConnectionAccess> From<KafkaSourceConnection<C>> for GenericSourceConnec
 impl<C: ConnectionAccess> From<PostgresSourceConnection<C>> for GenericSourceConnection<C> {
     fn from(conn: PostgresSourceConnection<C>) -> Self {
         Self::Postgres(conn)
+    }
+}
+
+impl From<KinesisSourceConnection> for GenericSourceConnection {
+    fn from(conn: KinesisSourceConnection) -> Self {
+        Self::Kinesis(conn)
     }
 }
 
@@ -1920,6 +1929,9 @@ impl<R: ConnectionResolver> IntoInlineConnection<GenericSourceConnection, R>
             GenericSourceConnection::Kafka(kafka) => {
                 GenericSourceConnection::Kafka(kafka.into_inline_connection(r))
             }
+            GenericSourceConnection::Kinesis(kinesis) => {
+                GenericSourceConnection::Kinesis(kinesis.into_inline_connection(r))
+            }
             GenericSourceConnection::Postgres(pg) => {
                 GenericSourceConnection::Postgres(pg.into_inline_connection(r))
             }
@@ -1935,6 +1947,7 @@ impl<C: ConnectionAccess> SourceConnection for GenericSourceConnection<C> {
     fn name(&self) -> &'static str {
         match self {
             Self::Kafka(conn) => conn.name(),
+            Self::Kinesis(conn) => conn.name(),
             Self::Postgres(conn) => conn.name(),
             Self::LoadGenerator(conn) => conn.name(),
             Self::TestScript(conn) => conn.name(),
@@ -1944,6 +1957,7 @@ impl<C: ConnectionAccess> SourceConnection for GenericSourceConnection<C> {
     fn upstream_name(&self) -> Option<&str> {
         match self {
             Self::Kafka(conn) => conn.upstream_name(),
+            Self::Kinesis(conn) => conn.upstream_name(),
             Self::Postgres(conn) => conn.upstream_name(),
             Self::LoadGenerator(conn) => conn.upstream_name(),
             Self::TestScript(conn) => conn.upstream_name(),
@@ -1953,6 +1967,7 @@ impl<C: ConnectionAccess> SourceConnection for GenericSourceConnection<C> {
     fn timestamp_desc(&self) -> RelationDesc {
         match self {
             Self::Kafka(conn) => conn.timestamp_desc(),
+            Self::Kinesis(conn) => conn.timestamp_desc(),
             Self::Postgres(conn) => conn.timestamp_desc(),
             Self::LoadGenerator(conn) => conn.timestamp_desc(),
             Self::TestScript(conn) => conn.timestamp_desc(),
@@ -1962,6 +1977,7 @@ impl<C: ConnectionAccess> SourceConnection for GenericSourceConnection<C> {
     fn connection_id(&self) -> Option<GlobalId> {
         match self {
             Self::Kafka(conn) => conn.connection_id(),
+            Self::Kinesis(conn) => conn.connection_id(),
             Self::Postgres(conn) => conn.connection_id(),
             Self::LoadGenerator(conn) => conn.connection_id(),
             Self::TestScript(conn) => conn.connection_id(),
@@ -1971,6 +1987,7 @@ impl<C: ConnectionAccess> SourceConnection for GenericSourceConnection<C> {
     fn metadata_columns(&self) -> Vec<(&str, ColumnType)> {
         match self {
             Self::Kafka(conn) => conn.metadata_columns(),
+            Self::Kinesis(conn) => conn.metadata_columns(),
             Self::Postgres(conn) => conn.metadata_columns(),
             Self::LoadGenerator(conn) => conn.metadata_columns(),
             Self::TestScript(conn) => conn.metadata_columns(),
@@ -1980,6 +1997,7 @@ impl<C: ConnectionAccess> SourceConnection for GenericSourceConnection<C> {
     fn metadata_column_types(&self) -> Vec<IncludedColumnSource> {
         match self {
             Self::Kafka(conn) => conn.metadata_column_types(),
+            Self::Kinesis(conn) => conn.metadata_column_types(),
             Self::Postgres(conn) => conn.metadata_column_types(),
             Self::LoadGenerator(conn) => conn.metadata_column_types(),
             Self::TestScript(conn) => conn.metadata_column_types(),
@@ -2008,6 +2026,7 @@ impl RustType<ProtoSourceConnection> for GenericSourceConnection<InlinedConnecti
         ProtoSourceConnection {
             kind: Some(match self {
                 GenericSourceConnection::Kafka(kafka) => Kind::Kafka(kafka.into_proto()),
+                GenericSourceConnection::Kinesis(kinesis) => Kind::Kinesis(kinesis.into_proto()),
                 GenericSourceConnection::Postgres(postgres) => {
                     Kind::Postgres(postgres.into_proto())
                 }
@@ -2028,11 +2047,93 @@ impl RustType<ProtoSourceConnection> for GenericSourceConnection<InlinedConnecti
             .ok_or_else(|| TryFromProtoError::missing_field("ProtoSourceConnection::kind"))?;
         Ok(match kind {
             Kind::Kafka(kafka) => GenericSourceConnection::Kafka(kafka.into_rust()?),
+            Kind::Kinesis(kinesis) => GenericSourceConnection::Kinesis(kinesis.into_rust()?),
             Kind::Postgres(postgres) => GenericSourceConnection::Postgres(postgres.into_rust()?),
             Kind::Loadgen(loadgen) => GenericSourceConnection::LoadGenerator(loadgen.into_rust()?),
             Kind::Testscript(testscript) => {
                 GenericSourceConnection::TestScript(testscript.into_rust()?)
             }
+        })
+    }
+}
+
+#[derive(Arbitrary, Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct KinesisSourceConnection<C: ConnectionAccess = InlinedConnection> {
+    pub connection_id: GlobalId,
+    pub connection: C::Aws,
+    pub stream_name: String,
+}
+
+impl<R: ConnectionResolver> IntoInlineConnection<KinesisSourceConnection, R>
+    for KinesisSourceConnection<ReferencedConnection>
+{
+    fn into_inline_connection(self, r: R) -> KinesisSourceConnection {
+        let KinesisSourceConnection {
+            connection_id,
+            connection,
+            stream_name,
+        } = self;
+
+        KinesisSourceConnection {
+            connection_id,
+            connection: r.resolve_connection(connection).unwrap_aws(),
+            stream_name,
+        }
+    }
+}
+
+pub static KINESIS_PROGRESS_DESC: Lazy<RelationDesc> = Lazy::new(|| {
+    //  In the future, kinesis will have a more complex ts
+    // RelationDesc::empty()
+    //     .with_column("shard_id", ScalarType::Int32.nullable(false))
+    //     .with_column("sequence_number", ScalarType::UInt64.nullable(true))
+    RelationDesc::empty().with_column("offset", ScalarType::UInt64.nullable(true))
+});
+
+impl<C: ConnectionAccess> SourceConnection for KinesisSourceConnection<C> {
+    fn name(&self) -> &'static str {
+        "kinesis"
+    }
+
+    fn upstream_name(&self) -> Option<&str> {
+        Some(self.stream_name.as_str())
+    }
+
+    fn timestamp_desc(&self) -> RelationDesc {
+        KINESIS_PROGRESS_DESC.clone()
+    }
+
+    fn connection_id(&self) -> Option<GlobalId> {
+        Some(self.connection_id)
+    }
+
+    fn metadata_columns(&self) -> Vec<(&str, ColumnType)> {
+        vec![]
+    }
+
+    fn metadata_column_types(&self) -> Vec<IncludedColumnSource> {
+        vec![]
+    }
+}
+
+impl RustType<ProtoKinesisSourceConnection> for KinesisSourceConnection {
+    fn into_proto(&self) -> ProtoKinesisSourceConnection {
+        ProtoKinesisSourceConnection {
+            stream_name: self.stream_name.clone(),
+            connection: Some(self.connection.into_proto()),
+            connection_id: Some(self.connection_id.into_proto()),
+        }
+    }
+
+    fn from_proto(proto: ProtoKinesisSourceConnection) -> Result<Self, TryFromProtoError> {
+        Ok(KinesisSourceConnection {
+            stream_name: proto.stream_name,
+            connection: proto
+                .connection
+                .into_rust_if_some("ProtoKinesisSourceConnection::connection")?,
+            connection_id: proto
+                .connection_id
+                .into_rust_if_some("ProtoKinesisSourceConnection::connection_id")?,
         })
     }
 }

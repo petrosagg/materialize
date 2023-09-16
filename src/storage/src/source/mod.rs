@@ -29,6 +29,7 @@ use crate::source::types::{SourceMessage, SourceReaderError};
 
 pub mod generator;
 mod kafka;
+mod kinesis;
 pub mod metrics;
 mod postgres;
 pub(crate) mod reclock;
