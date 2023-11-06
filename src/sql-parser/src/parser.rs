@@ -2184,10 +2184,12 @@ impl<'a> Parser<'a> {
             Envelope::Upsert
         } else if self.parse_keyword(MATERIALIZE) {
             Envelope::CdcV2
+        } else if self.parse_keyword(STRIIM) {
+            Envelope::Striim
         } else {
             return self.expected(
                 self.peek_pos(),
-                "NONE, DEBEZIUM, UPSERT, or MATERIALIZE",
+                "NONE, DEBEZIUM, UPSERT, STRIIM, or MATERIALIZE",
                 self.peek_token(),
             );
         };

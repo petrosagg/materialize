@@ -456,6 +456,7 @@ pub enum Envelope {
     Debezium(DbzMode),
     Upsert,
     CdcV2,
+    Striim,
 }
 
 impl Envelope {
@@ -468,6 +469,7 @@ impl Envelope {
             // (why is this a parser-level concept, anyway? Should it be moved?)
             Envelope::Debezium(DbzMode::Plain) => false,
             Envelope::Upsert => false,
+            Envelope::Striim => false,
             Envelope::CdcV2 => true,
         }
     }
@@ -489,6 +491,9 @@ impl AstDisplay for Envelope {
             }
             Self::CdcV2 => {
                 f.write_str("MATERIALIZE");
+            }
+            Self::Striim => {
+                f.write_str("STRIIM");
             }
         }
     }

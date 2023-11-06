@@ -562,6 +562,11 @@ where
                         health_update,
                     )
                 }
+                SourceEnvelope::Striim(striim_envelope) => {
+                    let (striim_ok, errors) =
+                        super::striim::render(striim_envelope, &decoded_stream);
+                    (striim_ok, Some(errors), empty(scope))
+                }
                 SourceEnvelope::None(none_envelope) => {
                     let results = append_metadata_to_value(decoded_stream);
 

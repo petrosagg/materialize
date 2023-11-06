@@ -568,6 +568,7 @@ impl Source {
                         Some("debezium")
                     }
                 },
+                SourceEnvelope::Striim(_) => Some("striim"),
                 SourceEnvelope::CdcV2 => {
                     // TODO(aljoscha): Should we even report this? It's
                     // currently not exposed.

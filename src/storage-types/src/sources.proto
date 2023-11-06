@@ -62,6 +62,7 @@ message ProtoSourceEnvelope {
         ProtoDebeziumEnvelope debezium = 2;
         ProtoUpsertEnvelope upsert = 3;
         google.protobuf.Empty cdc_v2 = 4;
+        ProtoStriimEnvelope striim = 5;
     }
 }
 
@@ -136,6 +137,11 @@ message ProtoDebeziumSourceProjection {
         ProtoPostgres postgres = 2;
         ProtoSqlServer sql_server = 3;
     }
+}
+
+message ProtoStriimEnvelope {
+    uint64 before_idx = 1;
+    uint64 after_idx = 2;
 }
 
 message ProtoKafkaMetadataColumn {

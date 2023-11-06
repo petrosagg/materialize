@@ -220,6 +220,7 @@ mod debezium;
 mod persist_sink;
 pub mod sinks;
 pub mod sources;
+mod striim;
 mod upsert;
 
 /// Assemble the "ingestion" side of a dataflow, i.e. the sources.

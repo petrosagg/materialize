@@ -135,7 +135,10 @@ impl<T> CollectionDescription<T> {
                     }
                     // NOTE: We explicitly list envelopes instead of using a catch all to
                     // make sure that we change this when adding/removing and envelope.
-                    SourceEnvelope::None(_) | SourceEnvelope::Upsert(_) | SourceEnvelope::CdcV2 => {
+                    SourceEnvelope::None(_)
+                    | SourceEnvelope::Upsert(_)
+                    | SourceEnvelope::Striim(_)
+                    | SourceEnvelope::CdcV2 => {
                         // No storage dependencies.
                     }
                 }

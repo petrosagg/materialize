@@ -54,7 +54,7 @@ use mz_storage_types::sources::{
     GenericSourceConnection, KafkaMetadataKind, KafkaSourceConnection, KeyEnvelope, LoadGenerator,
     LoadGeneratorSourceConnection, PostgresSourceConnection, PostgresSourcePublicationDetails,
     ProtoPostgresSourcePublicationDetails, SourceConnection, SourceDesc, SourceEnvelope,
-    TestScriptSourceConnection, Timeline, UnplannedSourceEnvelope, UpsertStyle,
+    StriimEnvelope, TestScriptSourceConnection, Timeline, UnplannedSourceEnvelope, UpsertStyle,
 };
 use prost::Message;
 
@@ -1132,6 +1132,14 @@ pub fn plan_create_source(
             }
             UnplannedSourceEnvelope::CdcV2
         }
+        mz_sql_parser::ast::Envelope::Striim => {
+            //TODO check that key envelope is not set
+            let (before_idx, after_idx) = typecheck_striim(&value_desc)?;
+            UnplannedSourceEnvelope::Striim(StriimEnvelope {
+                before_idx,
+                after_idx,
+            })
+        }
     };
 
     let metadata_columns = external_connection.metadata_columns();
@@ -1551,6 +1559,23 @@ fn typecheck_debezium(value_desc: &RelationDesc) -> Result<(Option<usize>, usize
     } else {
         None
     };
+    Ok((before_idx, after_idx))
+}
+
+fn typecheck_striim(value_desc: &RelationDesc) -> Result<(usize, usize), PlanError> {
+    let (before_idx, before_ty) = value_desc
+        .get_by_name(&"before".into())
+        .ok_or_else(|| sql_err!("'after' column missing from debezium input"))?;
+    let (after_idx, after_ty) = value_desc
+        .get_by_name(&"data".into())
+        .ok_or_else(|| sql_err!("'after' column missing from debezium input"))?;
+
+    if !matches!(before_ty.scalar_type, ScalarType::Record { .. }) {
+        sql_bail!("'before' column must be of type record");
+    }
+    if before_ty != after_ty {
+        sql_bail!("'before' type differs from 'after' column");
+    }
     Ok((before_idx, after_idx))
 }
 
@@ -2199,6 +2224,7 @@ pub fn plan_create_sink(
         Some(Envelope::Debezium(mz_sql_parser::ast::DbzMode::Plain)) => SinkEnvelope::Debezium,
         Some(Envelope::Upsert) => SinkEnvelope::Upsert,
         Some(Envelope::CdcV2) => bail_unsupported!("CDCv2 sinks"),
+        Some(Envelope::Striim) => bail_unsupported!("\"ENVELOPE STRIIM\" sinks"),
         Some(Envelope::None) => bail_unsupported!("\"ENVELOPE NONE\" sinks"),
     };
     let name = scx.allocate_qualified_name(normalize::unresolved_item_name(name)?)?;

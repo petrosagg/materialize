@@ -816,6 +816,8 @@ pub enum SourceEnvelope {
     /// `CdcV2` requires sources output messages in a strict form that requires a upstream-provided
     /// timeline.
     CdcV2,
+    /// The envelope produced by striim.com
+    Striim(StriimEnvelope),
 }
 
 impl RustType<ProtoSourceEnvelope> for SourceEnvelope {
@@ -827,6 +829,7 @@ impl RustType<ProtoSourceEnvelope> for SourceEnvelope {
                 SourceEnvelope::Debezium(e) => Kind::Debezium(e.into_proto()),
                 SourceEnvelope::Upsert(e) => Kind::Upsert(e.into_proto()),
                 SourceEnvelope::CdcV2 => Kind::CdcV2(()),
+                SourceEnvelope::Striim(e) => Kind::Striim(e.into_proto()),
             }),
         }
     }
@@ -841,6 +844,7 @@ impl RustType<ProtoSourceEnvelope> for SourceEnvelope {
             Kind::Debezium(e) => SourceEnvelope::Debezium(e.into_rust()?),
             Kind::Upsert(e) => SourceEnvelope::Upsert(e.into_rust()?),
             Kind::CdcV2(()) => SourceEnvelope::CdcV2,
+            Kind::Striim(e) => SourceEnvelope::Striim(e.into_rust()?),
         })
     }
 }
@@ -855,6 +859,7 @@ pub enum UnplannedSourceEnvelope {
     Debezium(DebeziumEnvelope),
     Upsert { style: UpsertStyle },
     CdcV2,
+    Striim(StriimEnvelope),
 }
 
 #[derive(Arbitrary, Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -1163,6 +1168,30 @@ impl RustType<ProtoDebeziumSourceProjection> for DebeziumSourceProjection {
     }
 }
 
+#[derive(Arbitrary, Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct StriimEnvelope {
+    /// The column index containing the `before` row
+    pub before_idx: usize,
+    /// The column index containing the `after` row
+    pub after_idx: usize,
+}
+
+impl RustType<ProtoStriimEnvelope> for StriimEnvelope {
+    fn into_proto(&self) -> ProtoStriimEnvelope {
+        ProtoStriimEnvelope {
+            before_idx: self.before_idx.into_proto(),
+            after_idx: self.after_idx.into_proto(),
+        }
+    }
+
+    fn from_proto(proto: ProtoStriimEnvelope) -> Result<Self, TryFromProtoError> {
+        Ok(StriimEnvelope {
+            before_idx: proto.before_idx.into_rust()?,
+            after_idx: proto.after_idx.into_rust()?,
+        })
+    }
+}
+
 /// Computes the indices of the value's relation description that appear in the key.
 ///
 /// Returns an error if it detects a common columns between the two relations that has the same
@@ -1223,6 +1252,7 @@ impl UnplannedSourceEnvelope {
                 key_arity: key_arity.unwrap_or(0),
             }),
             UnplannedSourceEnvelope::CdcV2 => SourceEnvelope::CdcV2,
+            UnplannedSourceEnvelope::Striim(envelope) => SourceEnvelope::Striim(envelope),
         }
     }
 
@@ -1346,6 +1376,19 @@ impl UnplannedSourceEnvelope {
                         ty => bail!("Unexpected type for MATERIALIZE envelope: {:?}", ty),
                     },
                     ty => bail!("Unexpected type for MATERIALIZE envelope: {:?}", ty),
+                }
+            }
+            UnplannedSourceEnvelope::Striim(envelope) => {
+                match &value_desc.typ().column_types[envelope.after_idx].scalar_type {
+                    ScalarType::Record { fields, .. } => {
+                        let desc = RelationDesc::from_names_and_types(fields.clone());
+                        let envelope = self.into_source_envelope(None, None, Some(desc.arity()));
+                        (envelope, desc)
+                    }
+                    ty => bail!(
+                        "Incorrect type for Debezium value, expected Record, got {:?}",
+                        ty
+                    ),
                 }
             }
         })
@@ -1743,7 +1786,10 @@ impl<C: ConnectionAccess> SourceDesc<C> {
             // Other combinations may produce retractions.
             SourceDesc {
                 envelope:
-                    SourceEnvelope::Debezium(_) | SourceEnvelope::Upsert(_) | SourceEnvelope::CdcV2,
+                    SourceEnvelope::Debezium(_)
+                    | SourceEnvelope::Upsert(_)
+                    | SourceEnvelope::CdcV2
+                    | SourceEnvelope::Striim(_),
                 connection:
                     GenericSourceConnection::Kafka(_) | GenericSourceConnection::TestScript(_),
                 ..
