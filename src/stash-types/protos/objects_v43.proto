@@ -19,7 +19,7 @@
 
 syntax = "proto3";
 
-package objects;
+package objects_v43;
 
 message ConfigKey {
     string key = 1;
@@ -178,6 +178,10 @@ message DurableCollectionMetadata {
 
     // StringWrapper remap_shard = 1;
     string data_shard = 2;
+}
+
+message DurableExportMetadata {
+    SinkAsOf initial_as_of = 1;
 }
 
 message CommentKey {

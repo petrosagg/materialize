@@ -87,7 +87,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use bytes::BufMut;
 use differential_dataflow::lattice::Lattice;
 use futures::Stream;
 use itertools::Itertools;
@@ -108,7 +107,7 @@ use mz_persist_txn::txn_read::TxnsCache;
 use mz_persist_txn::txns::TxnsHandle;
 use mz_persist_types::codec_impls::UnitSchema;
 use mz_persist_types::{Codec64, Opaque};
-use mz_proto::{IntoRustIfSome, ProtoType, RustType, TryFromProtoError};
+use mz_proto::RustType;
 use mz_repr::{ColumnName, Datum, Diff, GlobalId, RelationDesc, Row, TimestampManipulation};
 use mz_stash::{self, AppendBatch, StashFactory, TypedCollection};
 use mz_stash_types::metrics::Metrics as StashMetrics;
@@ -133,11 +132,8 @@ use mz_storage_types::controller::{
 };
 use mz_storage_types::instances::StorageInstanceId;
 use mz_storage_types::parameters::StorageParameters;
-use mz_storage_types::sinks::{ProtoDurableExportMetadata, SinkAsOf, StorageSinkDesc};
+use mz_storage_types::sinks::StorageSinkDesc;
 use mz_storage_types::sources::{IngestionDescription, SourceData, SourceExport};
-use proptest::prelude::{any, Arbitrary, BoxedStrategy, Strategy};
-use prost::Message;
-use serde::{Deserialize, Serialize};
 use timely::order::{PartialOrder, TotalOrder};
 use timely::progress::{Antichain, ChangeBatch, Timestamp};
 use tokio_stream::StreamMap;
@@ -155,118 +151,14 @@ mod statistics;
 pub static METADATA_COLLECTION: TypedCollection<proto::GlobalId, proto::DurableCollectionMetadata> =
     TypedCollection::new("storage-collection-metadata");
 
-pub static METADATA_EXPORT: TypedCollection<proto::GlobalId, proto::DurableExportMetadata> =
-    TypedCollection::new("storage-export-metadata-u64");
-
 pub static PERSIST_TXNS_SHARD: TypedCollection<(), String> =
     TypedCollection::new("persist-txns-shard");
 
 pub static ALL_COLLECTIONS: &[&str] = &[
     METADATA_COLLECTION.name(),
-    METADATA_EXPORT.name(),
     PERSIST_TXNS_SHARD.name(),
     command_wals::SHARD_FINALIZATION.name(),
 ];
-
-// Do this dance so that we keep the storage controller expressed in terms of a generic timestamp `T`.
-struct MetadataExportFetcher;
-trait MetadataExport<T>
-where
-    // Associated type would be better but you can't express this relationship without unstable
-    DurableExportMetadata<T>: RustType<proto::DurableExportMetadata>,
-{
-    fn get_stash_collection(
-    ) -> &'static TypedCollection<proto::GlobalId, proto::DurableExportMetadata>;
-}
-
-impl MetadataExport<mz_repr::Timestamp> for MetadataExportFetcher {
-    fn get_stash_collection(
-    ) -> &'static TypedCollection<proto::GlobalId, proto::DurableExportMetadata> {
-        &METADATA_EXPORT
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DurableExportMetadata<T> {
-    pub initial_as_of: SinkAsOf<T>,
-}
-
-impl PartialOrd for DurableExportMetadata<mz_repr::Timestamp> {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl std::cmp::Ord for DurableExportMetadata<mz_repr::Timestamp> {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        let mut s = vec![];
-        let mut o = vec![];
-        self.encode(&mut s);
-        other.encode(&mut o);
-        s.cmp(&o)
-    }
-}
-
-impl RustType<ProtoDurableExportMetadata> for DurableExportMetadata<mz_repr::Timestamp> {
-    fn into_proto(&self) -> ProtoDurableExportMetadata {
-        ProtoDurableExportMetadata {
-            initial_as_of: Some(self.initial_as_of.into_proto()),
-        }
-    }
-
-    fn from_proto(proto: ProtoDurableExportMetadata) -> Result<Self, TryFromProtoError> {
-        Ok(DurableExportMetadata {
-            initial_as_of: proto
-                .initial_as_of
-                .into_rust_if_some("ProtoDurableExportMetadata::initial_as_of")?,
-        })
-    }
-}
-
-impl RustType<mz_stash_types::objects::proto::DurableExportMetadata>
-    for DurableExportMetadata<mz_repr::Timestamp>
-{
-    fn into_proto(&self) -> mz_stash_types::objects::proto::DurableExportMetadata {
-        mz_stash_types::objects::proto::DurableExportMetadata {
-            initial_as_of: Some(self.initial_as_of.into_proto()),
-        }
-    }
-
-    fn from_proto(
-        proto: mz_stash_types::objects::proto::DurableExportMetadata,
-    ) -> Result<Self, TryFromProtoError> {
-        Ok(DurableExportMetadata {
-            initial_as_of: proto
-                .initial_as_of
-                .into_rust_if_some("DurableExportMetadata::initial_as_of")?,
-        })
-    }
-}
-
-impl DurableExportMetadata<mz_repr::Timestamp> {
-    pub fn encode<B: BufMut>(&self, buf: &mut B) {
-        let persisted: ProtoDurableExportMetadata = self.into_proto();
-        persisted
-            .encode(buf)
-            .expect("no required fields means no initialization errors");
-    }
-
-    pub fn decode(buf: &[u8]) -> Result<Self, String> {
-        let proto = ProtoDurableExportMetadata::decode(buf).map_err(|err| err.to_string())?;
-        proto.into_rust().map_err(|err| err.to_string())
-    }
-}
-
-impl Arbitrary for DurableExportMetadata<mz_repr::Timestamp> {
-    type Strategy = BoxedStrategy<Self>;
-    type Parameters = ();
-
-    fn arbitrary_with(_: Self::Parameters) -> Self::Strategy {
-        (any::<SinkAsOf<mz_repr::Timestamp>>(),)
-            .prop_map(|(initial_as_of,)| Self { initial_as_of })
-            .boxed()
-    }
-}
 
 /// A storage controller for a storage instance.
 #[derive(Debug)]
@@ -366,8 +258,6 @@ where
         + Into<mz_repr::Timestamp>,
     StorageCommand<T>: RustType<ProtoStorageCommand>,
     StorageResponse<T>: RustType<ProtoStorageResponse>,
-    MetadataExportFetcher: MetadataExport<T>,
-    DurableExportMetadata<T>: RustType<proto::DurableExportMetadata>,
 {
     type Timestamp = T;
 
@@ -1056,27 +946,10 @@ where
 
             let storage_dependencies = vec![from_id];
 
-            let value = MetadataExportFetcher::get_stash_collection()
-                .insert_key_without_overwrite(
-                    &mut self.stash,
-                    id.into_proto(),
-                    DurableExportMetadata {
-                        initial_as_of: description.sink.as_of.clone(),
-                    }
-                    .into_proto(),
-                )
-                .await?;
-            let mut durable_export_data = DurableExportMetadata::from_proto(value)
-                .map_err(|e| StorageError::IOError(e.into()))?;
-
-            durable_export_data
-                .initial_as_of
-                .downgrade(&dependency_since);
-
             info!(
                 sink_id = id.to_string(),
                 from_id = from_id.to_string(),
-                initial_as_of = ?durable_export_data.initial_as_of,
+                as_of = ?description.sink.as_of,
                 "create_exports: creating sink"
             );
 
@@ -1107,7 +980,7 @@ where
                     from_desc: description.sink.from_desc,
                     connection: description.sink.connection,
                     envelope: description.sink.envelope,
-                    as_of: durable_export_data.initial_as_of,
+                    as_of: description.sink.as_of,
                     status_id,
                     from_storage_metadata,
                 },
@@ -1979,16 +1852,14 @@ where
                 Box::pin(async move {
                     // Query all collections in parallel. Makes for triplicated
                     // names, but runs quick.
-                    let (metadata_collection, metadata_export, shard_finalization) = futures::join!(
+                    let (metadata_collection, shard_finalization) = futures::join!(
                         maybe_get_init_batch(&tx, &METADATA_COLLECTION),
-                        maybe_get_init_batch(&tx, &METADATA_EXPORT),
                         maybe_get_init_batch(&tx, &command_wals::SHARD_FINALIZATION),
                     );
-                    let batches: Vec<AppendBatch> =
-                        [metadata_collection, metadata_export, shard_finalization]
-                            .into_iter()
-                            .filter_map(|b| b)
-                            .collect();
+                    let batches: Vec<AppendBatch> = [metadata_collection, shard_finalization]
+                        .into_iter()
+                        .filter_map(|b| b)
+                        .collect();
 
                     tx.append(batches).await
                 })
