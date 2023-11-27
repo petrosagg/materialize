@@ -1329,3 +1329,208 @@ where
 
     (stream, health_stream, Rc::new(button.press_on_drop()))
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::{Duration, UNIX_EPOCH, SystemTime, Instant};
+
+    use anyhow::bail;
+    use mz_kafka_util::client::create_new_client_config_simple;
+    use rdkafka::error::KafkaError;
+    use rdkafka::{TopicPartitionList, Offset, Message};
+    use rdkafka::consumer::{BaseConsumer, Consumer};
+    use rdkafka::util::Timeout;
+    use rdkafka::producer::{BaseProducer, Producer, BaseRecord};
+    use rdkafka::admin::{AdminClient, TopicReplication, AdminOptions, NewTopic};
+    use uuid::Uuid;
+
+    #[tokio::test]
+    async fn transaction_test() -> Result<(), anyhow::Error> {
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+        let topic_name = format!("transaction-test-{now}");
+
+        let group_id = Uuid::new_v4().to_string();
+
+        let mut config = create_new_client_config_simple();
+        config.set("bootstrap.servers", "localhost:9092");
+        let admin_client: AdminClient<_> = config.create()?;
+
+        // Create the topic
+        mz_kafka_util::admin::ensure_topic(
+            &admin_client,
+            &AdminOptions::new().request_timeout(Some(Duration::from_secs(5))),
+            &NewTopic::new(&topic_name, 1, TopicReplication::Fixed(1)),
+        )
+        .await.unwrap();
+
+        let mut config = create_new_client_config_simple();
+        config.set("bootstrap.servers", "localhost:9092");
+        config.set("group.id", &group_id);
+        config.set("isolation.level", "read_uncommitted");
+        config.set("enable.auto.commit", "false");
+        config.set("auto.offset.reset", "earliest");
+        config.set("enable.partition.eof", "true");
+        let consumer: BaseConsumer<_> = config.create()?;
+
+        let mut config = create_new_client_config_simple();
+        config.set("bootstrap.servers", "localhost:9092");
+        config.set("group.id", &group_id);
+        config.set("isolation.level", "read_committed");
+        config.set("enable.auto.commit", "false");
+        config.set("auto.offset.reset", "earliest");
+        config.set("enable.partition.eof", "true");
+        let committed_consumer: BaseConsumer<_> = config.create()?;
+
+        let mut config = create_new_client_config_simple();
+        config.set("bootstrap.servers", "localhost:9092");
+        config.set("enable.idempotence", "true");
+        config.set("transactional.id", "main-producer");
+        config.set("transaction.timeout.ms", "10000");
+        let main_producer: BaseProducer<_> = config.create()?;
+
+        let mut config = create_new_client_config_simple();
+        config.set("bootstrap.servers", "localhost:9092");
+        config.set("enable.idempotence", "true");
+        config.set("transactional.id", "slow-producer");
+        config.set("transaction.timeout.ms", "10000");
+        let slow_producer: BaseProducer<_> = config.create()?;
+
+        let mut config = create_new_client_config_simple();
+        config.set("bootstrap.servers", "localhost:9092");
+        config.set("enable.idempotence", "true");
+        config.set("transactional.id", "fast-producer");
+        config.set("transaction.timeout.ms", "10000");
+        let fast_producer: BaseProducer<_> = config.create()?;
+
+        let run_flag = AtomicBool::new(true);
+        // The current value in the topic
+        let current_value = Mutex::new(None);
+        let mut observations = Vec::new();
+        std::thread::scope(|s| {
+            // A slow producer with an unrelated transactional id. It repeatedly:
+            // * Begins a transaction and publishes to the topic
+            // * Sleeps for 2 seconds
+            // * Commits the transaction
+            // * Sleeps for 2 seconds
+            s.spawn(|| {
+                slow_producer.init_transactions(Timeout::Never).unwrap();
+                while run_flag.load(Ordering::Relaxed) {
+                    slow_producer.begin_transaction().unwrap();
+                    let record = BaseRecord::to(&topic_name).payload(&[1]).key(&b"slow");
+                    slow_producer.send(record).unwrap();
+                    std::thread::sleep(Duration::from_secs(1));
+                    slow_producer.commit_transaction(Timeout::Never).unwrap();
+
+                    std::thread::sleep(Duration::from_secs(1));
+                }
+            });
+            // A fast producer with an unrelated transactional id. It repeatedly:
+            // * Begins a transaction and publishes to the topic
+            // * Commits the transaction
+            s.spawn(|| {
+                fast_producer.init_transactions(Timeout::Never).unwrap();
+                while run_flag.load(Ordering::Relaxed) {
+                    fast_producer.begin_transaction().unwrap();
+                    let record = BaseRecord::to(&topic_name).payload(&[1]).key(&b"fast");
+                    fast_producer.send(record).unwrap();
+                    fast_producer.commit_transaction(Timeout::Never).unwrap();
+                }
+            });
+            // The main producer writing unique data as fast as possible. Every time this thread
+            // commits a transaction it stores the latest data in a Mutex protected location.
+            s.spawn(|| {
+                main_producer.init_transactions(Timeout::Never).unwrap();
+                let mut value = 0u64;
+                while run_flag.load(Ordering::Relaxed) {
+                    main_producer.begin_transaction().unwrap();
+                    let payload = value.to_le_bytes();
+                    let record = BaseRecord::to(&topic_name).payload(&payload).key(&b"main");
+                    main_producer.send(record).unwrap();
+                    main_producer.commit_transaction(Timeout::Never).unwrap();
+                    *current_value.lock().unwrap() = Some(value);
+                    value += 1;
+                    main_producer.begin_transaction().unwrap();
+                    let record = BaseRecord::to(&topic_name).payload(&[0]).key(&b"main");
+                    main_producer.send(record).unwrap();
+                    main_producer.abort_transaction(Timeout::Never).unwrap();
+                }
+            });
+
+            // From the main thread we will observe the currently committed value and run
+            // `fetch_watermarks` to record what kafka thinks the high watermark is. The idea is
+            // that if `fetch_watermark` ever returns a stale high watermark that does not contain
+            // the value we know committed then the validation phase will fail.
+            let start = Instant::now();
+            while start.elapsed() < Duration::from_secs(10) {
+                // This is the most recent value successfully committed
+                let value_lower_bound: u64 = {
+                    match *current_value.lock().unwrap() {
+                        Some(value) => value,
+                        None => continue,
+                    }
+                };
+                // The high watermark we fetch here MUST point after the message that contains the
+                // most recently committed value.
+                let (_, hi) = consumer.fetch_watermarks(&topic_name, 0, Timeout::Never).unwrap();
+                observations.push((hi, value_lower_bound));
+            }
+            // Stop the other threads
+            run_flag.store(false, Ordering::Relaxed);
+        });
+
+        observations.sort();
+        observations.dedup();
+        println!("Collected {} observations and committed {:?} transactions", observations.len(), *current_value.lock().unwrap());
+
+        // Prepare to read the data
+        let mut tps = TopicPartitionList::new();
+        tps.add_partition(&topic_name, 0);
+        tps.set_partition_offset(&topic_name, 0, Offset::Beginning).unwrap();
+        committed_consumer.assign(&tps).unwrap();
+
+        let get_position = || {
+            let position = committed_consumer.position().unwrap().find_partition(&topic_name, 0).unwrap().offset();
+            match position {
+                Offset::Offset(position) => position,
+                Offset::Invalid => 0,
+                _ => panic!(),
+            }
+        };
+
+        // Get the highest high watermark from the observations and fetch all the data until that
+        // point.
+        let hi = observations.iter().map(|(hi, _)| hi).max().copied().unwrap();
+        let mut topic_data = vec![];
+        while get_position() < hi {
+            let message = match committed_consumer.poll(Duration::from_secs(5)) {
+                Some(Ok(message)) => message,
+                Some(Err(KafkaError::PartitionEOF(_))) => {
+                    // No message, but the consumer's position may have advanced
+                    // past a transaction control message that positions us at
+                    // or beyond the high water mark. Go around the loop again
+                    // to check.
+                    continue;
+                }
+                Some(Err(e)) => bail!("failed to fetch progress message {e}"),
+                None => bail!( "timed out while waiting to reach high water mark"),
+            };
+            if message.key() != Some(b"main") {
+                // This is a  message from the slow/fast producers which we don't care about.
+                continue;
+            }
+            let payload: [u8; 8] = message.payload().unwrap().try_into().unwrap();
+            let value = u64::from_le_bytes(payload);
+            topic_data.push((message.offset(), value));
+        }
+
+        for (hi, lower_bound) in observations {
+            let (offset, value) = topic_data.iter().filter(|(offset, _)| offset < &hi).max().copied().unwrap();
+            assert!(offset < hi);
+            assert!(lower_bound <= value);
+        }
+
+        Ok(())
+    }
+}
