@@ -5694,6 +5694,7 @@ dependencies = [
  "mz-storage-types",
  "mz-tls-util",
  "once_cell",
+ "prometheus",
  "proptest",
  "prost",
  "serde",

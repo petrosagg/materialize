@@ -95,7 +95,7 @@ use mz_build_info::BuildInfo;
 use mz_cluster_client::client::ClusterReplicaLocation;
 use mz_cluster_client::ReplicaId;
 
-use mz_ore::metrics::MetricsRegistry;
+use mz_ore::metrics::{DeleteOnDropGauge, MetricsRegistry};
 use mz_ore::now::{EpochMillis, NowFn};
 use mz_persist_client::cache::PersistClientCache;
 use mz_persist_client::critical::SinceHandle;
@@ -123,7 +123,7 @@ use mz_storage_client::controller::{
     ExportState, IntrospectionType, MonotonicAppender, ReadPolicy, SnapshotCursor,
     StorageController,
 };
-use mz_storage_client::metrics::StorageControllerMetrics;
+use mz_storage_client::metrics::StorageControllerMetricDefs;
 use mz_storage_types::collections as proto;
 use mz_storage_types::controller::{
     CollectionMetadata, DurableCollectionMetadata, PersistTxnTablesImpl, StorageError, TxnsCodecRow,
@@ -135,6 +135,7 @@ use mz_storage_types::sinks::{
 };
 use mz_storage_types::sources::{IngestionDescription, SourceData, SourceExport};
 use mz_storage_types::AlterCompatible;
+use prometheus::core::AtomicU64;
 use proptest::prelude::{any, Arbitrary, BoxedStrategy, Strategy};
 use prost::Message;
 use serde::{Deserialize, Serialize};
@@ -303,6 +304,90 @@ impl<T: Timestamp + Lattice + Codec64> PersistTxns<T> {
     }
 }
 
+#[derive(Debug)]
+struct ReplicaState {
+    metrics: ReplicaMetrics,
+}
+
+#[derive(Debug)]
+struct ReplicaMetrics {
+    _existence: DeleteOnDropGauge<'static, AtomicU64, Vec<String>>,
+    replica_objects: BTreeMap<GlobalId, DeleteOnDropGauge<'static, AtomicU64, Vec<String>>>,
+}
+
+#[derive(Debug)]
+struct ClusterState<T> {
+    id: StorageInstanceId,
+    metrics: ClusterMetrics,
+    metric_defs: StorageControllerMetricDefs,
+    replicas: BTreeMap<ReplicaId, ReplicaState>,
+    client: RehydratingStorageClient<T>,
+}
+
+impl<T> ClusterState<T>
+where
+    T: Timestamp + Lattice + Codec64,
+    StorageCommand<T>: RustType<ProtoStorageCommand>,
+    StorageResponse<T>: RustType<ProtoStorageResponse>,
+{
+    fn create_ingestion(&mut self, ingestion: RunIngestionCommand) {
+        self.metrics.cluster_objects.insert(
+            ingestion.id,
+            self.metric_defs
+                .for_object_in_cluster(self.id, ingestion.id),
+        );
+        for (replica_id, replica) in self.replicas.iter_mut() {
+            replica.metrics.replica_objects.insert(
+                ingestion.id,
+                self.metric_defs
+                    .for_object_in_replica(self.id, *replica_id, ingestion.id),
+            );
+        }
+        self.client
+            .send(StorageCommand::RunIngestions(vec![ingestion]));
+    }
+
+    fn drop_ingestion(&mut self, id: GlobalId) {
+        self.metrics.cluster_objects.remove(&id);
+        for replica in self.replicas.values_mut() {
+            replica.metrics.replica_objects.remove(&id);
+        }
+    }
+
+    fn connect_replica(&mut self, replica_id: ReplicaId, location: ClusterReplicaLocation) {
+        self.client.connect(location);
+
+        let mut replica_metrics = ReplicaMetrics {
+            _existence: self.metric_defs.for_replica(self.id, replica_id),
+            replica_objects: BTreeMap::new(),
+        };
+
+        for &object_id in self.metrics.cluster_objects.keys() {
+            replica_metrics.replica_objects.insert(
+                object_id,
+                self.metric_defs
+                    .for_object_in_replica(self.id, replica_id, object_id),
+            );
+        }
+        let replica = ReplicaState {
+            metrics: replica_metrics,
+        };
+
+        self.replicas.insert(replica_id, replica);
+    }
+
+    fn drop_replica(&mut self, replica_id: ReplicaId) {
+        self.client.reset();
+        self.replicas.remove(&replica_id);
+    }
+}
+
+#[derive(Debug)]
+struct ClusterMetrics {
+    _existence: DeleteOnDropGauge<'static, AtomicU64, Vec<String>>,
+    cluster_objects: BTreeMap<GlobalId, DeleteOnDropGauge<'static, AtomicU64, Vec<String>>>,
+}
+
 /// A storage controller for a storage instance.
 #[derive(Debug)]
 pub struct Controller<T: Timestamp + Lattice + Codec64 + From<EpochMillis> + TimestampManipulation>
@@ -313,7 +398,6 @@ pub struct Controller<T: Timestamp + Lattice + Codec64 + From<EpochMillis> + Tim
     now: NowFn,
     /// The fencing token for this instance of the controller.
     envd_epoch: NonZeroI64,
-
     /// Collections maintained by the storage controller.
     ///
     /// This collection only grows, although individual collections may be rendered unusable.
@@ -365,9 +449,7 @@ pub struct Controller<T: Timestamp + Lattice + Codec64 + From<EpochMillis> + Tim
         Arc<Mutex<BTreeMap<GlobalId, statistics::StatsInitState<SinkStatisticsUpdate>>>>,
 
     /// Clients for all known storage instances.
-    clients: BTreeMap<StorageInstanceId, RehydratingStorageClient<T>>,
-    /// For each storage instance the ID of its replica, if any.
-    replicas: BTreeMap<StorageInstanceId, ReplicaId>,
+    clusters: BTreeMap<StorageInstanceId, ClusterState<T>>,
     /// Set to `true` once `initialization_complete` has been called.
     initialized: bool,
     /// Storage configuration to apply to newly provisioned instances.
@@ -378,8 +460,8 @@ pub struct Controller<T: Timestamp + Lattice + Codec64 + From<EpochMillis> + Tim
     persist_location: PersistLocation,
     /// A persist client used to write to storage collections
     persist: Arc<PersistClientCache>,
-    /// Metrics of the Storage controller
-    metrics: StorageControllerMetrics,
+    /// Metric definition of the Storage controller
+    metric_defs: StorageControllerMetricDefs,
     /// Mechanism for the storage controller to send itself feedback, potentially emulating the
     /// responses we expect from clusters.
     ///
@@ -418,16 +500,18 @@ where
 
     fn initialization_complete(&mut self) {
         self.initialized = true;
-        for client in self.clients.values_mut() {
-            client.send(StorageCommand::InitializationComplete);
+        for cluster in self.clusters.values_mut() {
+            cluster.client.send(StorageCommand::InitializationComplete);
         }
     }
 
     fn update_configuration(&mut self, config_params: StorageParameters) {
         config_params.persist.apply(self.persist.cfg());
 
-        for client in self.clients.values_mut() {
-            client.send(StorageCommand::UpdateConfiguration(config_params.clone()));
+        for cluster in self.clusters.values_mut() {
+            cluster
+                .client
+                .send(StorageCommand::UpdateConfiguration(config_params.clone()));
         }
         self.config.update(config_params);
     }
@@ -456,7 +540,7 @@ where
     fn create_instance(&mut self, id: StorageInstanceId) {
         let mut client = RehydratingStorageClient::new(
             self.build_info,
-            self.metrics.for_instance(id),
+            self.metric_defs.for_instance_client(id),
             self.envd_epoch,
             self.config.grpc_client.clone(),
             self.now.clone(),
@@ -465,13 +549,26 @@ where
             client.send(StorageCommand::InitializationComplete);
         }
         client.send(StorageCommand::UpdateConfiguration(self.config.clone()));
-        let old_client = self.clients.insert(id, client);
-        assert!(old_client.is_none(), "storage instance {id} already exists");
+        let cluster = ClusterState {
+            id,
+            metric_defs: self.metric_defs.clone(),
+            metrics: ClusterMetrics {
+                _existence: self.metric_defs.for_instance(id),
+                cluster_objects: BTreeMap::new(),
+            },
+            replicas: BTreeMap::new(),
+            client,
+        };
+        let old_cluster = self.clusters.insert(id, cluster);
+        assert!(
+            old_cluster.is_none(),
+            "storage instance {id} already exists"
+        );
     }
 
     fn drop_instance(&mut self, id: StorageInstanceId) {
-        let client = self.clients.remove(&id);
-        assert!(client.is_some(), "storage instance {id} does not exist");
+        let cluster = self.clusters.remove(&id);
+        assert!(cluster.is_some(), "storage instance {id} does not exist");
     }
 
     fn connect_replica(
@@ -480,23 +577,17 @@ where
         replica_id: ReplicaId,
         location: ClusterReplicaLocation,
     ) {
-        let client = self
-            .clients
+        self.clusters
             .get_mut(&instance_id)
-            .unwrap_or_else(|| panic!("instance {instance_id} does not exist"));
-        client.connect(location);
-
-        self.replicas.insert(instance_id, replica_id);
+            .unwrap_or_else(|| panic!("instance {instance_id} does not exist"))
+            .connect_replica(replica_id, location);
     }
 
-    fn drop_replica(&mut self, instance_id: StorageInstanceId, _replica_id: ReplicaId) {
-        let client = self
-            .clients
+    fn drop_replica(&mut self, instance_id: StorageInstanceId, replica_id: ReplicaId) {
+        self.clusters
             .get_mut(&instance_id)
-            .unwrap_or_else(|| panic!("instance {instance_id} does not exist"));
-        client.reset();
-
-        self.replicas.remove(&instance_id);
+            .unwrap_or_else(|| panic!("instance {instance_id} does not exist"))
+            .drop_replica(replica_id);
     }
 
     // Add new migrations below and precede them with a short summary of the
@@ -744,6 +835,7 @@ where
                     write.upper().clone(),
                     vec![],
                     metadata.clone(),
+                    self.metric_defs.for_object(id),
                 );
 
                 match description.data_source {
@@ -861,8 +953,8 @@ where
                     let description = self.enrich_ingestion(id, ingestion)?;
 
                     // Fetch the client for this ingestion's instance.
-                    let client =
-                        self.clients
+                    let cluster =
+                        self.clusters
                             .get_mut(&description.instance_id)
                             .ok_or_else(|| StorageError::IngestionInstanceMissing {
                                 storage_instance_id: description.instance_id,
@@ -870,7 +962,7 @@ where
                             })?;
                     let augmented_ingestion = RunIngestionCommand { id, description };
 
-                    client.send(StorageCommand::RunIngestions(vec![augmented_ingestion]));
+                    cluster.create_ingestion(augmented_ingestion);
                 }
                 DataSource::Introspection(i) => {
                     let prev = self
@@ -1046,15 +1138,17 @@ where
             )?;
 
             // Fetch the client for this ingestion's instance.
-            let client = self
-                .clients
+            let cluster = self
+                .clusters
                 .get_mut(&description.instance_id)
                 .expect("verified exists");
 
-            client.send(StorageCommand::RunIngestions(vec![RunIngestionCommand {
-                id,
-                description,
-            }]));
+            cluster
+                .client
+                .send(StorageCommand::RunIngestions(vec![RunIngestionCommand {
+                    id,
+                    description,
+                }]));
         }
 
         Ok(())
@@ -1197,8 +1291,8 @@ where
             };
 
             // Fetch the client for this exports's cluster.
-            let client = self
-                .clients
+            let cluster = self
+                .clusters
                 .get_mut(&description.instance_id)
                 .ok_or_else(|| StorageError::ExportInstanceMissing {
                     storage_instance_id: description.instance_id,
@@ -1210,7 +1304,7 @@ where
                 .expect("poisoned")
                 .insert(id, statistics::StatsInitState(BTreeMap::new()));
 
-            client.send(StorageCommand::RunSinks(vec![cmd]));
+            cluster.client.send(StorageCommand::RunSinks(vec![cmd]));
         }
         Ok(())
     }
@@ -1296,7 +1390,7 @@ where
             }
 
             // Fetch the client for this exports's cluster.
-            let client = self.clients.get_mut(&instance_id).ok_or_else(|| {
+            let cluster = self.clusters.get_mut(&instance_id).ok_or_else(|| {
                 StorageError::ExportInstanceMissing {
                     storage_instance_id: instance_id,
                     export_id: *export_updates
@@ -1306,7 +1400,7 @@ where
                 }
             })?;
 
-            client.send(StorageCommand::RunSinks(cmds));
+            cluster.client.send(StorageCommand::RunSinks(cmds));
 
             // Update state only after all possible errors have occurred.
             for (id, export_state) in export_updates {
@@ -1710,9 +1804,9 @@ where
 
     async fn ready(&mut self) {
         let mut clients = self
-            .clients
+            .clusters
             .values_mut()
-            .map(|client| client.response_stream())
+            .map(|cluster| cluster.client.response_stream())
             .enumerate()
             .collect::<StreamMap<_, _>>();
 
@@ -1753,12 +1847,15 @@ where
                         self.persist_table_worker.drop_handle(*id);
                         self.persist_monotonic_worker.drop_handle(*id);
 
-                        self.collections.remove(id).map(
-                            |CollectionState {
-                                 collection_metadata: CollectionMetadata { data_shard, .. },
-                                 ..
-                             }| data_shard,
-                        )
+                        let collection = self.collections.remove(id)?;
+                        if let Some(cluster_id) = collection.cluster_id() {
+                            self.clusters
+                                .get_mut(&cluster_id)
+                                .expect("missing cluster")
+                                .drop_ingestion(*id);
+                        }
+
+                        Some(collection.collection_metadata.data_shard)
                     })
                     .collect();
 
@@ -1836,7 +1933,7 @@ where
             // TODO(aljoscha): What's up with this TODO?
             // Note that while collections are dropped, the `client` may already
             // be cleared out, before we do this post-processing!
-            let client = cluster_id.and_then(|cluster_id| self.clients.get_mut(&cluster_id));
+            let cluster = cluster_id.and_then(|cluster_id| self.clusters.get_mut(&cluster_id));
 
             if cluster_id.is_some() && frontier.is_empty() {
                 if self.collections.get(&id).is_some() {
@@ -1875,8 +1972,8 @@ where
 
             // Note that while collections are dropped, the `client` may already
             // be cleared out, before we do this post-processing!
-            if let Some(client) = client {
-                client.send(StorageCommand::AllowCompaction(vec![(
+            if let Some(cluster) = cluster {
+                cluster.client.send(StorageCommand::AllowCompaction(vec![(
                     id,
                     frontier.clone(),
                 )]));
@@ -2013,19 +2110,29 @@ where
 
         // Enrich `frontiers` with storage frontiers.
         for (object_id, collection) in self.active_collections() {
-            let replica_id = collection
-                .cluster_id()
-                .and_then(|c| self.replicas.get(&c))
-                .copied();
-            if let Some(replica_id) = replica_id {
+            let Some(cluster_id) = collection.cluster_id() else {
+                continue;
+            };
+            let replica_ids = self
+                .clusters
+                .get(&cluster_id)
+                .expect("missing cluster")
+                .replicas
+                .keys();
+            for &replica_id in replica_ids {
                 let upper = collection.write_frontier.clone();
                 frontiers.insert((object_id, replica_id), upper);
             }
         }
         for (object_id, export) in self.active_exports() {
             let cluster_id = export.cluster_id();
-            let replica_id = self.replicas.get(&cluster_id).copied();
-            if let Some(replica_id) = replica_id {
+            let replica_ids = self
+                .clusters
+                .get(&cluster_id)
+                .expect("missing cluster")
+                .replicas
+                .keys();
+            for &replica_id in replica_ids {
                 let upper = export.write_frontier.clone();
                 frontiers.insert((object_id, replica_id), upper);
             }
@@ -2424,15 +2531,14 @@ where
             envd_epoch,
             source_statistics: Arc::new(Mutex::new(BTreeMap::new())),
             sink_statistics: Arc::new(Mutex::new(BTreeMap::new())),
-            clients: BTreeMap::new(),
-            replicas: BTreeMap::new(),
+            clusters: BTreeMap::new(),
             initialized: false,
             config: StorageParameters::default(),
             internal_response_sender: tx,
             internal_response_queue: rx,
             persist_location,
             persist: persist_clients,
-            metrics: StorageControllerMetrics::new(metrics_registry),
+            metric_defs: StorageControllerMetricDefs::new(metrics_registry),
             recorded_frontiers: BTreeMap::new(),
             recorded_replica_frontiers: BTreeMap::new(),
             privatelink_status_table_latest: None,
@@ -3148,12 +3254,12 @@ where
         mut ingestion: IngestionDescription,
     ) -> Result<(), StorageError> {
         // Check that the client exists.
-        self.clients
-            .get(&ingestion.instance_id)
-            .ok_or(StorageError::IngestionInstanceMissing {
+        self.clusters.get(&ingestion.instance_id).ok_or(
+            StorageError::IngestionInstanceMissing {
                 storage_instance_id: ingestion.instance_id,
                 ingestion_id: id,
-            })?;
+            },
+        )?;
 
         // Take a cloned copy of the description because we are going to treat it as a "scratch
         // space".

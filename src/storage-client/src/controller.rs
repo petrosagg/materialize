@@ -29,6 +29,7 @@ use differential_dataflow::lattice::Lattice;
 use itertools::Itertools;
 use mz_cluster_client::client::ClusterReplicaLocation;
 use mz_cluster_client::ReplicaId;
+use mz_ore::metrics::DeleteOnDropGauge;
 use mz_persist_client::read::{Cursor, ReadHandle};
 use mz_persist_client::stats::SnapshotStats;
 use mz_persist_types::Codec64;
@@ -38,6 +39,7 @@ use mz_storage_types::instances::StorageInstanceId;
 use mz_storage_types::parameters::StorageParameters;
 use mz_storage_types::sinks::{MetadataUnfilled, StorageSinkConnection, StorageSinkDesc};
 use mz_storage_types::sources::{IngestionDescription, SourceData, SourceEnvelope};
+use prometheus::core::AtomicU64;
 use serde::{Deserialize, Serialize};
 use timely::progress::frontier::{AntichainRef, MutableAntichain};
 use timely::progress::{Antichain, ChangeBatch, Timestamp};
@@ -91,6 +93,19 @@ pub enum DataSource {
     /// controller, e.g. it's a materialized view, table, or subsource.
     // TODO? Add a means to track some data sources' GlobalIds.
     Other(DataSourceOther),
+}
+
+impl DataSource {
+    /// Returns the cluster to which the collection is bound, if applicable.
+    pub fn cluster_id(&self) -> Option<StorageInstanceId> {
+        match self {
+            DataSource::Ingestion(ingestion) => Some(ingestion.instance_id),
+            DataSource::Webhook
+            | DataSource::Introspection(_)
+            | DataSource::Other(_)
+            | DataSource::Progress => None,
+        }
+    }
 }
 
 /// Describes how data is written to a collection maintained outside of the
@@ -659,6 +674,8 @@ pub struct CollectionState<T> {
     pub write_frontier: Antichain<T>,
 
     pub collection_metadata: CollectionMetadata,
+
+    pub _existence: DeleteOnDropGauge<'static, AtomicU64, Vec<String>>,
 }
 
 impl<T: Timestamp> CollectionState<T> {
@@ -669,9 +686,11 @@ impl<T: Timestamp> CollectionState<T> {
         write_frontier: Antichain<T>,
         storage_dependencies: Vec<GlobalId>,
         metadata: CollectionMetadata,
+        existence: DeleteOnDropGauge<'static, AtomicU64, Vec<String>>,
     ) -> Self {
         let mut read_capabilities = MutableAntichain::new();
         read_capabilities.update_iter(since.iter().map(|time| (time.clone(), 1)));
+
         Self {
             description,
             read_capabilities,
@@ -682,18 +701,13 @@ impl<T: Timestamp> CollectionState<T> {
             storage_dependencies,
             write_frontier,
             collection_metadata: metadata,
+            _existence: existence,
         }
     }
 
     /// Returns the cluster to which the collection is bound, if applicable.
     pub fn cluster_id(&self) -> Option<StorageInstanceId> {
-        match &self.description.data_source {
-            DataSource::Ingestion(ingestion) => Some(ingestion.instance_id),
-            DataSource::Webhook
-            | DataSource::Introspection(_)
-            | DataSource::Other(_)
-            | DataSource::Progress => None,
-        }
+        self.description.data_source.cluster_id()
     }
 
     /// Returns whether the collection was dropped.
