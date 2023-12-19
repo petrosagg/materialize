@@ -134,7 +134,6 @@ pub(super) fn validate_options_per_connection_type(
         CreateConnectionType::Ssh => &[Host, Port, User],
         CreateConnectionType::MySql => &[
             AwsPrivatelink,
-            Database,
             Host,
             Password,
             Port,
@@ -391,9 +390,6 @@ impl ConnectionOptionExtracted {
                 let tunnel = scx.build_tunnel_definition(self.ssh_tunnel, self.aws_privatelink)?;
 
                 Connection::MySql(MySqlConnection {
-                    database: self
-                        .database
-                        .ok_or_else(|| sql_err!("DATABASE option is required"))?,
                     password: self.password.map(|password| password.into()),
                     host: self
                         .host
