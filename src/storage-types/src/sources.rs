@@ -1785,6 +1785,11 @@ impl<C: ConnectionAccess> SourceDesc<C> {
                 connection: GenericSourceConnection::Postgres(_),
                 ..
             } => false,
+            // MySQL can produce retractions (deletes)
+            SourceDesc {
+                connection: GenericSourceConnection::MySql(_),
+                ..
+            } => false,
             // Loadgen can produce retractions (deletes)
             SourceDesc {
                 connection: GenericSourceConnection::LoadGenerator(g),
@@ -1859,6 +1864,7 @@ impl<C: ConnectionAccess> crate::AlterCompatible for SourceDesc<C> {
 pub enum GenericSourceConnection<C: ConnectionAccess = InlinedConnection> {
     Kafka(KafkaSourceConnection<C>),
     Postgres(PostgresSourceConnection<C>),
+    MySql(MySqlSourceConnection<C>),
     LoadGenerator(LoadGeneratorSourceConnection),
     TestScript(TestScriptSourceConnection),
 }
@@ -1872,6 +1878,12 @@ impl<C: ConnectionAccess> From<KafkaSourceConnection<C>> for GenericSourceConnec
 impl<C: ConnectionAccess> From<PostgresSourceConnection<C>> for GenericSourceConnection<C> {
     fn from(conn: PostgresSourceConnection<C>) -> Self {
         Self::Postgres(conn)
+    }
+}
+
+impl<C: ConnectionAccess> From<MySqlSourceConnection<C>> for GenericSourceConnection<C> {
+    fn from(conn: MySqlSourceConnection<C>) -> Self {
+        Self::MySql(conn)
     }
 }
 
@@ -1898,6 +1910,9 @@ impl<R: ConnectionResolver> IntoInlineConnection<GenericSourceConnection, R>
             GenericSourceConnection::Postgres(pg) => {
                 GenericSourceConnection::Postgres(pg.into_inline_connection(r))
             }
+            GenericSourceConnection::MySql(mysql) => {
+                GenericSourceConnection::MySql(mysql.into_inline_connection(r))
+            }
             GenericSourceConnection::LoadGenerator(lg) => {
                 GenericSourceConnection::LoadGenerator(lg)
             }
@@ -1911,6 +1926,7 @@ impl<C: ConnectionAccess> SourceConnection for GenericSourceConnection<C> {
         match self {
             Self::Kafka(conn) => conn.name(),
             Self::Postgres(conn) => conn.name(),
+            Self::MySql(conn) => conn.name(),
             Self::LoadGenerator(conn) => conn.name(),
             Self::TestScript(conn) => conn.name(),
         }
@@ -1920,6 +1936,7 @@ impl<C: ConnectionAccess> SourceConnection for GenericSourceConnection<C> {
         match self {
             Self::Kafka(conn) => conn.upstream_name(),
             Self::Postgres(conn) => conn.upstream_name(),
+            Self::MySql(conn) => conn.upstream_name(),
             Self::LoadGenerator(conn) => conn.upstream_name(),
             Self::TestScript(conn) => conn.upstream_name(),
         }
@@ -1929,6 +1946,7 @@ impl<C: ConnectionAccess> SourceConnection for GenericSourceConnection<C> {
         match self {
             Self::Kafka(conn) => conn.timestamp_desc(),
             Self::Postgres(conn) => conn.timestamp_desc(),
+            Self::MySql(conn) => conn.timestamp_desc(),
             Self::LoadGenerator(conn) => conn.timestamp_desc(),
             Self::TestScript(conn) => conn.timestamp_desc(),
         }
@@ -1938,6 +1956,7 @@ impl<C: ConnectionAccess> SourceConnection for GenericSourceConnection<C> {
         match self {
             Self::Kafka(conn) => conn.connection_id(),
             Self::Postgres(conn) => conn.connection_id(),
+            Self::MySql(conn) => conn.connection_id(),
             Self::LoadGenerator(conn) => conn.connection_id(),
             Self::TestScript(conn) => conn.connection_id(),
         }
@@ -1947,6 +1966,7 @@ impl<C: ConnectionAccess> SourceConnection for GenericSourceConnection<C> {
         match self {
             Self::Kafka(conn) => conn.metadata_columns(),
             Self::Postgres(conn) => conn.metadata_columns(),
+            Self::MySql(conn) => conn.metadata_columns(),
             Self::LoadGenerator(conn) => conn.metadata_columns(),
             Self::TestScript(conn) => conn.metadata_columns(),
         }
@@ -1989,6 +2009,7 @@ impl RustType<ProtoSourceConnection> for GenericSourceConnection<InlinedConnecti
                 GenericSourceConnection::Postgres(postgres) => {
                     Kind::Postgres(postgres.into_proto())
                 }
+                GenericSourceConnection::MySql(mysql) => Kind::Mysql(mysql.into_proto()),
                 GenericSourceConnection::LoadGenerator(loadgen) => {
                     Kind::Loadgen(loadgen.into_proto())
                 }
@@ -2007,6 +2028,7 @@ impl RustType<ProtoSourceConnection> for GenericSourceConnection<InlinedConnecti
         Ok(match kind {
             Kind::Kafka(kafka) => GenericSourceConnection::Kafka(kafka.into_rust()?),
             Kind::Postgres(postgres) => GenericSourceConnection::Postgres(postgres.into_rust()?),
+            Kind::Mysql(mysql) => GenericSourceConnection::MySql(mysql.into_rust()?),
             Kind::Loadgen(loadgen) => GenericSourceConnection::LoadGenerator(loadgen.into_rust()?),
             Kind::Testscript(testscript) => {
                 GenericSourceConnection::TestScript(testscript.into_rust()?)
@@ -2251,6 +2273,131 @@ impl RustType<ProtoPostgresSourcePublicationDetails> for PostgresSourcePublicati
             slot: proto.slot,
             timeline_id: proto.timeline_id,
         })
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct MySqlSourceConnection<C: ConnectionAccess = InlinedConnection> {
+    pub connection_id: GlobalId,
+    pub connection: C::MySql,
+    pub details: MySqlSourceDetails,
+}
+
+impl<R: ConnectionResolver> IntoInlineConnection<MySqlSourceConnection, R>
+    for MySqlSourceConnection<ReferencedConnection>
+{
+    fn into_inline_connection(self, r: R) -> MySqlSourceConnection {
+        let MySqlSourceConnection {
+            connection_id,
+            connection,
+            details,
+        } = self;
+
+        MySqlSourceConnection {
+            connection_id,
+            connection: r.resolve_connection(connection).unwrap_mysql(),
+            details,
+        }
+    }
+}
+
+impl<C: ConnectionAccess> Arbitrary for MySqlSourceConnection<C> {
+    type Strategy = BoxedStrategy<Self>;
+    type Parameters = ();
+
+    fn arbitrary_with(_: Self::Parameters) -> Self::Strategy {
+        (
+            any::<C::MySql>(),
+            any::<GlobalId>(),
+            any::<MySqlSourceDetails>(),
+        )
+            .prop_map(|(connection, connection_id, details)| Self {
+                connection,
+                connection_id,
+                details,
+            })
+            .boxed()
+    }
+}
+
+pub static MYSQL_PROGRESS_DESC: Lazy<RelationDesc> = Lazy::new(|| {
+    RelationDesc::empty()
+        // TODO(petrosagg): UUIDs in ranges are not supported and additionally the
+        // Partitioned timestamp type forces you to deal with open/closed ranges which are
+        // difficult to represent manually. In this case they are unecessary though because
+        // we could just have two columns `source_id_start`, `source_id_end` that are always
+        // inclusive and have the convention that a range of a single element corresponds to
+        // an actual source_id being ingested.
+        // use
+        // .with_column(
+        //     "source_id",
+        //     ScalarType::Range {
+        //         element_type: Box::new(ScalarType::Uuid),
+        //     }
+        //     .nullable(false),
+        // )
+        .with_column("transaction_id", ScalarType::UInt64.nullable(false))
+});
+
+impl<C: ConnectionAccess> SourceConnection for MySqlSourceConnection<C> {
+    fn name(&self) -> &'static str {
+        "mysql"
+    }
+
+    fn upstream_name(&self) -> Option<&str> {
+        None
+    }
+
+    fn timestamp_desc(&self) -> RelationDesc {
+        MYSQL_PROGRESS_DESC.clone()
+    }
+
+    fn connection_id(&self) -> Option<GlobalId> {
+        Some(self.connection_id)
+    }
+
+    fn metadata_columns(&self) -> Vec<(&str, ColumnType)> {
+        vec![]
+    }
+}
+
+// TODO(roshan): implement alter comaptibility logic
+impl<C: ConnectionAccess> crate::AlterCompatible for MySqlSourceConnection<C> {}
+
+impl RustType<ProtoMySqlSourceConnection> for MySqlSourceConnection {
+    fn into_proto(&self) -> ProtoMySqlSourceConnection {
+        ProtoMySqlSourceConnection {
+            connection: Some(self.connection.into_proto()),
+            connection_id: Some(self.connection_id.into_proto()),
+            details: Some(self.details.into_proto()),
+        }
+    }
+
+    fn from_proto(proto: ProtoMySqlSourceConnection) -> Result<Self, TryFromProtoError> {
+        Ok(MySqlSourceConnection {
+            connection: proto
+                .connection
+                .into_rust_if_some("ProtoMySqlSourceConnection::connection")?,
+            connection_id: proto
+                .connection_id
+                .into_rust_if_some("ProtoMySqlSourceConnection::connection_id")?,
+            details: proto
+                .details
+                .into_rust_if_some("ProtoMySqlSourceConnection::details")?,
+        })
+    }
+}
+
+#[derive(Arbitrary, Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct MySqlSourceDetails {}
+
+impl RustType<ProtoMySqlSourceDetails> for MySqlSourceDetails {
+    fn into_proto(&self) -> ProtoMySqlSourceDetails {
+        ProtoMySqlSourceDetails {}
+    }
+
+    fn from_proto(proto: ProtoMySqlSourceDetails) -> Result<Self, TryFromProtoError> {
+        Ok(MySqlSourceDetails {})
     }
 }
 
