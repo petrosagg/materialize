@@ -14,7 +14,16 @@ from materialize.mzcompose.services.testdrive import Testdrive
 
 SERVICES = [
     Materialized(),
-    MySql(),
+    MySql(
+        additional_args=[
+            "--log-bin=mysql-bin",
+            "--gtid_mode=ON",
+            "--enforce_gtid_consistency=ON",
+            "--binlog-format=row",
+            "--log-slave-updates",
+            "--binlog-row-image=full",
+        ]
+    ),
     Testdrive(default_timeout="60s"),
 ]
 
@@ -29,6 +38,7 @@ def workflow_default(c: Composition, parser: WorkflowArgumentParser) -> None:
     args = parser.parse_args()
 
     c.up("materialized", "mysql")
+
     c.run(
         "testdrive",
         f"--var=mysql-root-password={MySql.DEFAULT_ROOT_PASSWORD}",

@@ -21,6 +21,13 @@ pub struct MySqlTableDesc {
     pub columns: Vec<MySqlColumnDesc>,
 }
 
+impl MySqlTableDesc {
+    /// Returns the fully qualified name {schema}.{table} of this table
+    pub fn qualified_name(&self) -> String {
+        format!("{}.{}", self.schema_name, self.name)
+    }
+}
+
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct MySqlColumnDesc {
     /// The name of the column.

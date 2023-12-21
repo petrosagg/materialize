@@ -16,6 +16,9 @@ use serde::{Deserialize, Serialize};
 use timely::order::{PartialOrder, TotalOrder};
 use timely::progress::timestamp::{PathSummary, Refines, Timestamp};
 
+// TODO: Implement GTID set parsing -> Partitioned timestamp
+// like vitess: https://github.com/vitessio/vitess/blob/main/go/mysql/replication/mysql56_gtid_set.go
+
 /// Represents a MySQL transaction id. Its maximum value
 #[derive(Debug, Clone, Copy, Ord, PartialOrd, Eq, PartialEq, Hash, Serialize, Deserialize)]
 pub struct TransactionId(i64);

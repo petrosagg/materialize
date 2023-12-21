@@ -84,7 +84,10 @@ mod desc;
 pub use desc::{MySqlColumnDesc, MySqlDataType, MySqlTableDesc};
 
 mod replication;
-pub use replication::{ensure_full_row_binlog_format, ensure_gtid_consistency, query_sys_var};
+pub use replication::{
+    ensure_full_row_binlog_format, ensure_gtid_consistency, ensure_replication_commit_order,
+    query_sys_var,
+};
 
 pub mod schemas;
 pub use schemas::schema_info;

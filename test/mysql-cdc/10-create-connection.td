@@ -72,3 +72,21 @@ contains:Connection refused
     PASSWORD SECRET badpass
   )
 contains:Access denied for user 'root'
+
+
+$ mysql-connect name=mysql url=mysql://root@mysql password=${arg.mysql-root-password}
+
+$ mysql-execute name=mysql
+DROP DATABASE IF EXISTS dummyschema;
+CREATE DATABASE dummyschema;
+USE dummyschema;
+CREATE TABLE dummy (f1 INTEGER PRIMARY KEY, id VARCHAR(128));
+INSERT INTO dummy VALUES (123, "dummy data");
+INSERT INTO dummy VALUES (234, "moar dummy");
+COMMIT;
+
+> CREATE SOURCE foo FROM MYSQL CONNECTION mysq (DETAILS '') FOR ALL TABLES;
+# a subsource named "dummy" and a progress collection named "foo_progress" will now exist
+> SELECT * FROM dummy;
+"123 dummy data"
+"234 moar dummy"
