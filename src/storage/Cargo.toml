@@ -31,7 +31,8 @@ http = "0.2.8"
 indexmap = { version = "2.0.0", default-features = false, features = ["std"] }
 itertools = { version = "0.10.5" }
 maplit = "1.0.2"
-mysql_async = { version = "0.33.0", default-features = false, features = ["minimal"] }
+mysql_async = { version = "0.33.0", default-features = false, features = ["minimal", "binlog"] }
+mysql_common = { version = "0.31.0", default-features = false }
 mz-avro = { path = "../avro", features = ["snappy"] }
 mz-aws-util = { path = "../aws-util", features = ["s3"] }
 mz-build-info = { path = "../build-info" }

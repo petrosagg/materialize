@@ -7,6 +7,7 @@
 // the Business Source License, use of this software will be governed
 // by the Apache License, Version 2.0.
 
+use core::ops::Add;
 use std::fmt;
 
 use mz_expr::PartitionId;
@@ -21,7 +22,7 @@ use timely::progress::timestamp::{PathSummary, Refines, Timestamp};
 
 /// Represents a MySQL transaction id. Its maximum value
 #[derive(Debug, Clone, Copy, Ord, PartialOrd, Eq, PartialEq, Hash, Serialize, Deserialize)]
-pub struct TransactionId(i64);
+pub struct TransactionId(u64);
 
 impl fmt::Display for TransactionId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -29,10 +30,24 @@ impl fmt::Display for TransactionId {
     }
 }
 
+impl From<TransactionId> for u64 {
+    fn from(id: TransactionId) -> Self {
+        id.0
+    }
+}
+
 impl TransactionId {
-    pub fn new(id: i64) -> Self {
+    pub fn new(id: u64) -> Self {
         assert!(id >= 0, "invalid negative transaction id: {id}");
         Self(id)
+    }
+}
+
+impl Add for TransactionId {
+    type Output = Self;
+
+    fn add(self, other: Self) -> Self {
+        Self::new(self.0 + other.0)
     }
 }
 
@@ -80,7 +95,7 @@ impl SourceTimestamp for TransactionId {
             PartitionId::None,
             "invalid non-partitioned partition {pid}"
         );
-        let id: i64 = offset.offset.try_into().expect("invalid transaction id");
+        let id: u64 = offset.offset.try_into().expect("invalid transaction id");
         Self::new(id)
     }
 
@@ -90,13 +105,17 @@ impl SourceTimestamp for TransactionId {
     }
 
     fn encode_row(&self) -> Row {
-        Row::pack([Datum::Int64(self.0)])
+        Row::pack([Datum::UInt64(
+            self.0.try_into().expect("verified non-negative"),
+        )])
     }
 
     fn decode_row(row: &Row) -> Self {
         let mut datums = row.iter();
         match (datums.next(), datums.next()) {
-            (Some(Datum::Int64(id)), None) => Self::new(id),
+            (Some(Datum::UInt64(id)), None) => {
+                Self::new(id.try_into().expect("verified non-negative"))
+            }
             _ => panic!("invalid row {row:?}"),
         }
     }

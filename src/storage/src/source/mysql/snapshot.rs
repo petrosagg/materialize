@@ -9,6 +9,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::rc::Rc;
+use std::str::FromStr;
 
 use differential_dataflow::{AsCollection, Collection};
 use futures::TryStreamExt;
@@ -23,7 +24,7 @@ use tracing::trace;
 use mz_expr::MirScalarExpr;
 use mz_mysql_util::{
     ensure_full_row_binlog_format, ensure_gtid_consistency, ensure_replication_commit_order,
-    query_sys_var,
+    query_sys_var, GtidSet,
 };
 use mz_mysql_util::{schema_info, MySqlTableDesc};
 use mz_repr::{Datum, Diff, GlobalId, Row};
@@ -167,7 +168,7 @@ pub(crate) fn render<G: Scope<Timestamp = TransactionId>>(
 
                 // Record the GTID set at the start of the snapshot
                 let snapshot_gtid_set = query_sys_var(lock_conn.as_mut().expect("lock_conn just created"), "global.gtid_executed").await?;
-
+                let snapshot_gtid_set = GtidSet::from_str(snapshot_gtid_set.as_str())?;
                 trace!(%id, "timely-{worker_id} acquired table locks at start gtid set: {snapshot_gtid_set:?}");
                 // TODO(roshan): Insert metric for how long it took to acquire the locks
 
@@ -184,12 +185,13 @@ pub(crate) fn render<G: Scope<Timestamp = TransactionId>>(
                 return Ok(());
             }
 
-            let mut client = connection_config.connect(&task_name, &config.config.connection_context.ssh_tunnel_manager).await?;
+            let mut conn = connection_config.connect(&task_name, &config.config.connection_context.ssh_tunnel_manager).await?;
 
             // Verify the MySQL system settings are correct for consistent row-based replication using GTIDs
-            ensure_gtid_consistency(&mut client).await?;
-            ensure_full_row_binlog_format(&mut client).await?;
-            ensure_replication_commit_order(&mut client).await?;
+            // TODO: Should these return DefiniteError instead of TransientError?
+            ensure_gtid_consistency(&mut conn).await?;
+            ensure_full_row_binlog_format(&mut conn).await?;
+            ensure_replication_commit_order(&mut conn).await?;
 
             // Wait for the start_gtids from the leader, which indicate that the table locks have
             // been acquired and we should start a transaction.
@@ -210,13 +212,13 @@ pub(crate) fn render<G: Scope<Timestamp = TransactionId>>(
                 .with_isolation_level(IsolationLevel::RepeatableRead)
                 .with_consistent_snapshot(true)
                 .with_readonly(true);
-            client.start_transaction(tx_opts).await?;
-            client.query_drop("set @@session.time_zone = '+00:00'")
+            conn.start_transaction(tx_opts).await?;
+            conn.query_drop("set @@session.time_zone = '+00:00'")
                 .await?;
 
             // Read the schemas of the tables we are snapshotting
             // TODO(roshan): Only request the schemas of the tables we are snapshotting
-            let _ = schema_info(&mut client, vec!["dummyschema"]).await?;
+            let _ = schema_info(&mut conn, vec!["dummyschema"]).await?;
             // TODO: verify the schema matches the expected schema
 
             // Send a signal to the leader that we have started our transaction
@@ -261,7 +263,7 @@ pub(crate) fn render<G: Scope<Timestamp = TransactionId>>(
             for (table_qualified_name, (output_index, table_desc, _casts)) in reader_snapshot_table_info {
                 let query = format!("SELECT * FROM {}", table_qualified_name);
                 trace!(%id, "timely-{worker_id} reading snapshot from table: {table_qualified_name}\n{table_desc:?}");
-                let mut results = client.query_stream(query).await?;
+                let mut results = conn.query_stream(query).await?;
                 while let Some(row) = results.try_next().await? {
                     let mut row: MySqlRow = row;
                     let mut packer = final_row.packer();
@@ -286,7 +288,7 @@ pub(crate) fn render<G: Scope<Timestamp = TransactionId>>(
     });
 
     // TODO: Split row decoding into a separate operator that can be distributed across all workers
-
     let snapshot_updates = raw_data.as_collection();
+
     (snapshot_updates, rewinds, errors, button.press_on_drop())
 }
