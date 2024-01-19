@@ -32,6 +32,7 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use enum_kinds::EnumKind;
+use http::Uri;
 use maplit::btreeset;
 use mz_adapter_types::compaction::CompactionWindow;
 use mz_controller_types::{ClusterId, ReplicaId};
@@ -791,9 +792,15 @@ pub struct CopyFromPlan {
 #[derive(Debug)]
 pub struct CopyToPlan {
     pub from: CopyToFrom,
-    pub to: MirScalarExpr,
+    pub to: CopyToTarget,
     pub connection: mz_storage_types::connections::Connection<ReferencedConnection>,
     pub format_params: CopyFormatParams<'static>,
+}
+
+#[derive(Debug)]
+pub enum CopyToTarget {
+    Resolved(Uri),
+    Unresolved(MirScalarExpr),
 }
 
 #[derive(Debug, Clone)]

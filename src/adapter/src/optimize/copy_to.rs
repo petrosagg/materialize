@@ -17,7 +17,6 @@ use mz_adapter_types::connection::ConnectionId;
 use mz_compute_types::plan::Plan;
 use mz_compute_types::sinks::{ComputeSinkConnection, ComputeSinkDesc, CopyToSinkConnection};
 use mz_compute_types::ComputeInstanceId;
-use mz_ore::collections::CollectionExt;
 use mz_ore::soft_assert_or_log;
 use mz_repr::explain::trace_plan;
 use mz_repr::{GlobalId, RelationDesc, Timestamp};
@@ -121,16 +120,6 @@ impl GlobalLirPlan {
         let sink_exports = &self.df_desc.sink_exports;
         let sink_id = sink_exports.keys().next().expect("valid sink");
         *sink_id
-    }
-
-    pub fn as_of(&self) -> Option<Timestamp> {
-        self.df_desc.as_of.clone().map(|as_of| as_of.into_element())
-    }
-
-    pub fn sink_desc(&self) -> &ComputeSinkDesc {
-        let sink_exports = &self.df_desc.sink_exports;
-        let sink_desc = sink_exports.values().next().expect("valid sink");
-        sink_desc
     }
 }
 

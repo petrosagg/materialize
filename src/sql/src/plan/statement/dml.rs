@@ -812,7 +812,7 @@ fn plan_copy_to(
 
     Ok(Plan::CopyTo(CopyToPlan {
         from,
-        to,
+        to: plan::CopyToTarget::Unresolved(to),
         connection: connection.to_owned(),
         format_params,
     }))
