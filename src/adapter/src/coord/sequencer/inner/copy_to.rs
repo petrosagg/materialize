@@ -16,16 +16,32 @@ use mz_sql::plan::{self, CopyToPlan};
 use crate::coord::{Coordinator, TargetCluster};
 use crate::optimize::dataflows::{prep_scalar_expr, EvalTime, ExprPrepStyle};
 use crate::session::Session;
-use crate::{AdapterError, ExecuteResponse};
+use crate::{AdapterError, ExecuteContext, ExecuteResponse};
 
 impl Coordinator {
     #[tracing::instrument(level = "debug", skip(self))]
     pub(crate) async fn sequence_copy_to(
         &mut self,
+        ctx: ExecuteContext,
+        plan: plan::CopyToPlan,
+        target_cluster: TargetCluster,
+    ) {
+        let result = self
+            .execute_copy_to_stage(ctx.session(), plan, target_cluster)
+            .await;
+        ctx.retire(result);
+    }
+
+    /// Processes as many `create materialized view` stages as possible.
+    #[tracing::instrument(level = "debug", skip_all)]
+    pub(crate) async fn execute_copy_to_stage(
+        &mut self,
         session: &Session,
         plan: plan::CopyToPlan,
         target_cluster: TargetCluster,
     ) -> Result<ExecuteResponse, AdapterError> {
+        // TODO(mouli): break down into stages later
+
         let CopyToPlan {
             from: _from,
             mut to,
@@ -55,7 +71,6 @@ impl Coordinator {
             Err(e) => coord_bail!("could not parse COPY TO target url: {}", e),
         };
 
-        // TODO(mouli): Implement this
         Err(AdapterError::Internal(format!(
             "COPY TO '{}' is not yet implemented",
             to_url,
