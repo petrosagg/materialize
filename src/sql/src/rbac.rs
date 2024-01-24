@@ -737,13 +737,16 @@ fn generate_rbac_requirements(
             ..Default::default()
         },
         Plan::CopyTo(plan::CopyToPlan {
-            from,
+            source,
+            when: _,
+            finishing: _,
+            desc: _,
             to: _,
             connection: _,
             format_params: _,
         }) => {
             let mut privileges =
-                generate_read_privileges(catalog, from.depends_on().into_iter(), role_id);
+                generate_read_privileges(catalog, source.depends_on().into_iter(), role_id);
             if let Some(cluster_id) = target_cluster_id {
                 privileges.push((
                     SystemObjectId::Object(cluster_id.into()),

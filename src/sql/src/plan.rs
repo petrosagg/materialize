@@ -791,7 +791,10 @@ pub struct CopyFromPlan {
 
 #[derive(Debug)]
 pub struct CopyToPlan {
-    pub from: CopyToFrom,
+    pub source: MirRelationExpr,
+    pub when: QueryWhen,
+    pub finishing: RowSetFinishing,
+    pub desc: RelationDesc,
     pub to: CopyToTarget,
     pub connection: mz_storage_types::connections::Connection<ReferencedConnection>,
     pub format_params: CopyFormatParams<'static>,
@@ -801,27 +804,6 @@ pub struct CopyToPlan {
 pub enum CopyToTarget {
     Resolved(Uri),
     Unresolved(MirScalarExpr),
-}
-
-#[derive(Debug, Clone)]
-pub enum CopyToFrom {
-    Id {
-        id: GlobalId,
-        // TODO(mouli): add support to specify columns
-    },
-    Query {
-        expr: MirRelationExpr,
-        desc: RelationDesc,
-        finishing: RowSetFinishing,
-    },
-}
-impl CopyToFrom {
-    pub fn depends_on(&self) -> BTreeSet<GlobalId> {
-        match self {
-            CopyToFrom::Id { id } => BTreeSet::from([*id]),
-            CopyToFrom::Query { expr, .. } => expr.depends_on(),
-        }
-    }
 }
 
 #[derive(Clone, Debug)]
