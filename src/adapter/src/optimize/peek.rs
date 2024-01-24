@@ -14,14 +14,13 @@ use std::sync::Arc;
 
 use mz_compute_types::dataflows::IndexDesc;
 use mz_compute_types::plan::Plan;
-use mz_compute_types::sinks::{ComputeSinkConnection, ComputeSinkDesc, CopyToSinkConnection};
 use mz_compute_types::ComputeInstanceId;
 use mz_expr::{
     permutation_for_arrangement, MirRelationExpr, MirScalarExpr, OptimizedMirRelationExpr,
     RowSetFinishing,
 };
 use mz_repr::explain::trace_plan;
-use mz_repr::{GlobalId, RelationDesc, RelationType, Timestamp};
+use mz_repr::{GlobalId, RelationType, Timestamp};
 use mz_sql::plan::HirRelationExpr;
 use mz_transform::dataflow::DataflowMetainfo;
 use mz_transform::normalize_lets::normalize_lets;
@@ -299,23 +298,6 @@ impl<'s> Optimize<LocalMirPlan<ResolvedLocal<'s>>> for Optimizer {
                 typ.clone(),
             );
         }
-        // TODO(mouli): export sink here
-        let from_desc = RelationDesc::new(expr.typ(), desc.iter_names());
-        let from_id = self.transient_id;
-
-        // Make SinkDesc
-        let sink_desc = ComputeSinkDesc {
-            from: from_id,
-            from_desc,
-            connection: ComputeSinkConnection::CopyTo(CopyToSinkConnection::default()),
-            with_snapshot: true,
-            up_to: Default::default(),
-            // No `FORCE NOT NULL` for copy to
-            non_null_assertions: vec![],
-            // No `REFRESH` for copy to
-            refresh_schedule: None,
-        };
-        df_desc.export_sink(from_id, sink_desc);
 
         let df_meta = mz_transform::optimize_dataflow(
             &mut df_desc,

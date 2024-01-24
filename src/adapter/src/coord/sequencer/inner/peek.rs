@@ -18,8 +18,8 @@ use mz_repr::{GlobalId, Timestamp};
 use mz_sql::catalog::CatalogCluster;
 // Import `plan` module, but only import select elements to avoid merge conflicts on use statements.
 use mz_catalog::memory::objects::CatalogItem;
+use mz_sql::plan;
 use mz_sql::plan::QueryWhen;
-use mz_sql::plan::{self, CopySelectTo};
 use mz_transform::{EmptyStatisticsOracle, StatisticsOracle};
 use tracing::Instrument;
 use tracing::{event, warn, Level};
@@ -611,11 +611,11 @@ impl Coordinator {
         }
 
         match copy_to {
-            Some(CopySelectTo::StdOut(format)) => Ok(ExecuteResponse::CopyTo {
+            None => Ok(resp),
+            Some(format) => Ok(ExecuteResponse::CopyTo {
                 format,
                 resp: Box::new(resp),
             }),
-            _ => Ok(resp), // the copy to should have already been handled
         }
     }
 
