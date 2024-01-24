@@ -242,6 +242,11 @@ pub enum Message<T = mz_repr::Timestamp> {
         otel_ctx: OpenTelemetryContext,
         stage: PeekStage,
     },
+    CopyToStageReady {
+        ctx: ExecuteContext,
+        otel_ctx: OpenTelemetryContext,
+        stage: CopyToStage,
+    },
     CreateIndexStageReady {
         ctx: ExecuteContext,
         otel_ctx: OpenTelemetryContext,
@@ -302,6 +307,7 @@ impl Message {
                 "execute_single_statement_transaction"
             }
             Message::PeekStageReady { .. } => "peek_stage_ready",
+            Message::CopyToStageReady { .. } => "copy_to_ready",
             Message::CreateIndexStageReady { .. } => "create_index_stage_ready",
             Message::CreateViewStageReady { .. } => "create_view_stage_ready",
             Message::CreateMaterializedViewStageReady { .. } => {
@@ -369,13 +375,26 @@ pub enum RealTimeRecencyContext {
         optimizer: optimize::peek::Optimizer,
         global_mir_plan: optimize::peek::GlobalMirPlan,
     },
+    CopyTo {
+        ctx: ExecuteContext,
+        root_otel_ctx: OpenTelemetryContext,
+        when: QueryWhen,
+        target_replica: Option<ReplicaId>,
+        timeline_context: TimelineContext,
+        oracle_read_ts: Option<Timestamp>,
+        source_ids: BTreeSet<GlobalId>,
+        in_immediate_multi_stmt_txn: bool,
+        optimizer: optimize::copy_to::Optimizer,
+        global_mir_plan: optimize::copy_to::GlobalMirPlan,
+    },
 }
 
 impl RealTimeRecencyContext {
     pub(crate) fn take_context(self) -> ExecuteContext {
         match self {
             RealTimeRecencyContext::ExplainTimestamp { ctx, .. }
-            | RealTimeRecencyContext::Peek { ctx, .. } => ctx,
+            | RealTimeRecencyContext::Peek { ctx, .. }
+            | RealTimeRecencyContext::CopyTo { ctx, .. } => ctx,
         }
     }
 }
@@ -631,59 +650,82 @@ pub struct CreateMaterializedViewExplain {
 
 #[derive(Debug)]
 pub enum CopyToStage {
-    Validate(CopyToValidate),
-    OptimizeMir(CopyToOptimizeMir),
-    OptimizeLir(CopyToOptimizeLir),
-    Finish(CopyToFinish),
+    Validate(CopyToStageValidate),
+    Timestamp(CopyToStageTimestamp),
+    Optimize(CopyToStageOptimize),
+    RealTimeRecency(CopyToStageRealTimeRecency),
+    Finish(CopyToStageFinish),
 }
 
 impl CopyToStage {
     fn validity(&mut self) -> Option<&mut PlanValidity> {
         match self {
-            Self::Validate(_) => None,
-            Self::OptimizeMir(stage) => Some(&mut stage.validity),
-            Self::OptimizeLir(stage) => Some(&mut stage.validity),
-            Self::Finish(stage) => Some(&mut stage.validity),
+            CopyToStage::Validate(_) => None,
+            CopyToStage::Timestamp(CopyToStageTimestamp { validity, .. })
+            | CopyToStage::Optimize(CopyToStageOptimize { validity, .. })
+            | CopyToStage::RealTimeRecency(CopyToStageRealTimeRecency { validity, .. })
+            | CopyToStage::Finish(CopyToStageFinish { validity, .. }) => Some(validity),
         }
     }
 }
 
 #[derive(Debug)]
-pub struct CopyToValidate {
-    plan: plan::CopyToPlan,
+pub struct CopyToStageValidate {
+    plan: mz_sql::plan::CopyToPlan,
     target_cluster: TargetCluster,
 }
 
 #[derive(Debug)]
-pub struct CopyToOptimizeMir {
+pub struct CopyToStageTimestamp {
     validity: PlanValidity,
-    plan: plan::CopyToPlan,
-    timeline: TimelineContext,
-}
-
-#[derive(Debug)]
-pub struct CopyToTimestamp {
-    validity: PlanValidity,
-    plan: plan::CopyToPlan,
-    timeline: TimelineContext,
+    source: MirRelationExpr,
+    source_ids: BTreeSet<GlobalId>,
+    when: QueryWhen,
+    target_replica: Option<ReplicaId>,
+    timeline_context: TimelineContext,
+    in_immediate_multi_stmt_txn: bool,
     optimizer: optimize::copy_to::Optimizer,
-    global_mir_plan: optimize::copy_to::GlobalMirPlan<optimize::copy_to::Unresolved>,
 }
 
 #[derive(Debug)]
-pub struct CopyToOptimizeLir {
+pub struct CopyToStageOptimize {
     validity: PlanValidity,
-    plan: plan::CopyToPlan,
+    source: MirRelationExpr,
+    source_ids: BTreeSet<GlobalId>,
+    when: QueryWhen,
+    target_replica: Option<ReplicaId>,
+    timeline_context: TimelineContext,
+    oracle_read_ts: Option<Timestamp>,
+    in_immediate_multi_stmt_txn: bool,
     optimizer: optimize::copy_to::Optimizer,
-    global_mir_plan: optimize::copy_to::GlobalMirPlan<optimize::copy_to::Resolved>,
 }
 
 #[derive(Debug)]
-pub struct CopyToFinish {
+pub struct CopyToStageRealTimeRecency {
     validity: PlanValidity,
-    cluster_id: ComputeInstanceId,
-    plan: plan::CopyToPlan,
-    global_lir_plan: optimize::copy_to::GlobalLirPlan,
+    source_ids: BTreeSet<GlobalId>,
+    id_bundle: CollectionIdBundle,
+    when: QueryWhen,
+    target_replica: Option<ReplicaId>,
+    timeline_context: TimelineContext,
+    oracle_read_ts: Option<Timestamp>,
+    in_immediate_multi_stmt_txn: bool,
+    optimizer: optimize::copy_to::Optimizer,
+    global_mir_plan: optimize::copy_to::GlobalMirPlan,
+}
+
+#[derive(Debug)]
+pub struct CopyToStageFinish {
+    validity: PlanValidity,
+    id_bundle: Option<CollectionIdBundle>,
+    when: QueryWhen,
+    target_replica: Option<ReplicaId>,
+    timeline_context: TimelineContext,
+    oracle_read_ts: Option<Timestamp>,
+    source_ids: BTreeSet<GlobalId>,
+    real_time_recency_ts: Option<mz_repr::Timestamp>,
+    optimizer: optimize::copy_to::Optimizer,
+    global_mir_plan: optimize::copy_to::GlobalMirPlan,
 }
 
 #[derive(Debug)]

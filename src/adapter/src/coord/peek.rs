@@ -435,6 +435,7 @@ impl FastPathPlan {
 
 impl crate::coord::Coordinator {
     /// Implements a peek plan produced by `create_plan` above.
+    // XXX: copy this method to the copy_to module
     #[tracing::instrument(level = "debug", skip(self))]
     pub async fn implement_peek_plan(
         &mut self,

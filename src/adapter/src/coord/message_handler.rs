@@ -34,15 +34,14 @@ use crate::command::Command;
 use crate::coord::appends::Deferred;
 use crate::coord::statement_logging::StatementLoggingId;
 use crate::coord::{
-    Coordinator, CreateConnectionValidationReady, Message, PeekStage, PeekStageFinish,
-    PendingReadTxn, PlanValidity, PurifiedStatementReady, RealTimeRecencyContext,
+    AlterConnectionValidationReady, Coordinator, CopyToStage, CopyToStageFinish,
+    CreateConnectionValidationReady, Message, PeekStage, PeekStageFinish, PendingReadTxn,
+    PlanValidity, PurifiedStatementReady, RealTimeRecencyContext,
 };
 use crate::session::Session;
 use crate::statement_logging::StatementLifecycleEvent;
 use crate::util::{ComputeSinkId, ResultExt};
 use crate::{catalog, AdapterNotice, TimestampContext};
-
-use super::AlterConnectionValidationReady;
 
 impl Coordinator {
     /// BOXED FUTURE: As of Nov 2023 the returned Future from this function was 74KB. This would
@@ -156,6 +155,14 @@ impl Coordinator {
                 } => {
                     otel_ctx.attach_as_parent();
                     self.sequence_peek_stage(ctx, otel_ctx, stage).await;
+                }
+                Message::CopyToStageReady {
+                    ctx,
+                    otel_ctx,
+                    stage,
+                } => {
+                    otel_ctx.attach_as_parent();
+                    self.sequence_copy_to_stage(ctx, otel_ctx, stage).await;
                 }
                 Message::CreateIndexStageReady {
                     ctx,
@@ -865,6 +872,36 @@ impl Coordinator {
                     PeekStage::Finish(PeekStageFinish {
                         validity,
                         copy_to,
+                        id_bundle: None,
+                        when,
+                        target_replica,
+                        timeline_context,
+                        oracle_read_ts,
+                        source_ids,
+                        real_time_recency_ts: Some(real_time_recency_ts),
+                        optimizer,
+                        global_mir_plan,
+                    }),
+                )
+                .await;
+            }
+            RealTimeRecencyContext::CopyTo {
+                ctx,
+                root_otel_ctx,
+                when,
+                target_replica,
+                timeline_context,
+                oracle_read_ts,
+                source_ids,
+                in_immediate_multi_stmt_txn: _,
+                optimizer,
+                global_mir_plan,
+            } => {
+                self.sequence_copy_to_stage(
+                    ctx,
+                    root_otel_ctx,
+                    CopyToStage::Finish(CopyToStageFinish {
+                        validity,
                         id_bundle: None,
                         when,
                         target_replica,
