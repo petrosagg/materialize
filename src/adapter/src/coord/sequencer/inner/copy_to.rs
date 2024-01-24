@@ -13,11 +13,12 @@ use http::Uri;
 use mz_repr::{Datum, RowArena};
 use mz_sql::plan::{self, CopyToTarget};
 use timely::progress::Antichain;
+use tokio::sync::mpsc;
 
 use crate::coord::sequencer::inner::{check_log_reads, return_if_err};
 use crate::coord::{
-    Coordinator, CopyToFinish, CopyToOptimizeLir, CopyToOptimizeMir, CopyToStage, CopyToTimestamp,
-    CopyToValidate, PlanValidity, TargetCluster,
+    Coordinator, CopyToFinish, CopyToOptimizeLir, CopyToOptimizeMir, CopyToStage, CopyToValidate,
+    PlanValidity, TargetCluster,
 };
 use crate::optimize::dataflows::{prep_scalar_expr, EvalTime, ExprPrepStyle};
 use crate::optimize::Optimize;
@@ -65,11 +66,8 @@ impl Coordinator {
                     (ctx, CopyToStage::OptimizeMir(next))
                 }
                 OptimizeMir(stage) => {
-                    let next = return_if_err!(self.copy_to_optimize_mir(&mut ctx, stage), ctx);
-                    (ctx, CopyToStage::Timestamp(next))
-                }
-                Timestamp(stage) => {
-                    let next = return_if_err!(self.copy_to_timestamp(&mut ctx, stage).await, ctx);
+                    let next =
+                        return_if_err!(self.copy_to_optimize_mir(&mut ctx, stage).await, ctx);
                     (ctx, CopyToStage::OptimizeLir(next))
                 }
                 OptimizeLir(stage) => {
@@ -156,7 +154,7 @@ impl Coordinator {
         session.add_notices(notices);
 
         // Determine timeline.
-        let mut timeline = self.validate_timeline_context(depends_on.clone())?;
+        let timeline = self.validate_timeline_context(depends_on.clone())?;
 
         let validity = PlanValidity {
             transient_revision: self.catalog().transient_revision(),
@@ -173,7 +171,7 @@ impl Coordinator {
         })
     }
 
-    fn copy_to_optimize_mir(
+    async fn copy_to_optimize_mir(
         &mut self,
         ctx: &mut ExecuteContext,
         CopyToOptimizeMir {
@@ -181,7 +179,7 @@ impl Coordinator {
             plan,
             timeline,
         }: CopyToOptimizeMir,
-    ) -> Result<CopyToTimestamp, AdapterError> {
+    ) -> Result<CopyToOptimizeLir, AdapterError> {
         // Collect optimizer parameters.
         let compute_instance = self
             .instance_snapshot(validity.cluster_id.expect("cluser_id"))
@@ -204,26 +202,6 @@ impl Coordinator {
             .catch_unwind_optimize(plan.from.clone())
             .map_err(|e| AdapterError::Optimizer(e))?;
 
-        Ok(CopyToTimestamp {
-            validity,
-            plan,
-            timeline,
-            optimizer,
-            global_mir_plan,
-        })
-    }
-
-    async fn copy_to_timestamp(
-        &mut self,
-        ctx: &mut ExecuteContext,
-        CopyToTimestamp {
-            validity,
-            plan,
-            timeline,
-            optimizer,
-            global_mir_plan,
-        }: CopyToTimestamp,
-    ) -> Result<CopyToOptimizeLir, AdapterError> {
         let when = plan::QueryWhen::Immediately;
         // Timestamp selection
         let oracle_read_ts = self.oracle_read_ts(&ctx.session, &timeline, &when).await;
@@ -286,7 +264,15 @@ impl Coordinator {
             global_lir_plan,
         }: CopyToFinish,
     ) -> Result<ExecuteResponse, AdapterError> {
-        let sink_id = global_lir_plan.sink_id();
+        let (df_desc, df_meta) = global_lir_plan.unapply();
+        // Emit notices.
+        self.emit_optimizer_notices(ctx.session(), &df_meta.optimizer_notices);
+
+        // Ship dataflow.
+        let ship_dataflow_fut = self.ship_dataflow(df_desc, cluster_id);
+        ship_dataflow_fut.await;
+
+        let (tx, rx) = mpsc::unbounded_channel::<u64>();
 
         Err(AdapterError::Internal(format!(
             "COPY TO '{:?}' is not yet implemented",

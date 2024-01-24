@@ -633,7 +633,6 @@ pub struct CreateMaterializedViewExplain {
 pub enum CopyToStage {
     Validate(CopyToValidate),
     OptimizeMir(CopyToOptimizeMir),
-    Timestamp(CopyToTimestamp),
     OptimizeLir(CopyToOptimizeLir),
     Finish(CopyToFinish),
 }
@@ -643,7 +642,6 @@ impl CopyToStage {
         match self {
             Self::Validate(_) => None,
             Self::OptimizeMir(stage) => Some(&mut stage.validity),
-            Self::Timestamp(stage) => Some(&mut stage.validity),
             Self::OptimizeLir(stage) => Some(&mut stage.validity),
             Self::Finish(stage) => Some(&mut stage.validity),
         }

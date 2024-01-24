@@ -12,11 +12,15 @@ use std::rc::Rc;
 
 use differential_dataflow::Collection;
 use mz_compute_types::sinks::{ComputeSinkDesc, CopyToSinkConnection};
+use mz_ore::collections::CollectionExt;
 use mz_repr::{Diff, GlobalId, Row, Timestamp};
 use mz_storage_types::controller::CollectionMetadata;
 use mz_storage_types::errors::DataflowError;
+use timely::dataflow::channels::pact::Pipeline;
+use timely::dataflow::operators::generic::builder_rc::OperatorBuilder;
 use timely::dataflow::Scope;
 use timely::progress::Antichain;
+use timely::PartialOrder;
 
 use crate::render::sinks::SinkRender;
 
@@ -36,7 +40,41 @@ where
     where
         G: Scope<Timestamp = Timestamp>,
     {
+        let name = format!("copy_to-{}", sink_id);
+        let mut op = OperatorBuilder::new(name, sinked_collection.scope());
+        let mut ok_input = op.new_input(&sinked_collection.inner, Pipeline);
+        let mut err_input = op.new_input(&err_collection.inner, Pipeline);
+
+        let up_to = sink.up_to.clone();
         // TODO(mouli): implement!
-        todo!()
+
+        op.build(|_cap| {
+            let mut finished = false;
+            let mut ok_buf = Default::default();
+
+            move |frontiers| {
+                if finished {
+                    // Drain the inputs, to avoid the operator being constantly rescheduled
+                    ok_input.for_each(|_, _| {});
+                    err_input.for_each(|_, _| {});
+                    return;
+                }
+                let mut frontier = Antichain::new();
+                for input_frontier in frontiers {
+                    frontier.extend(input_frontier.frontier().iter().copied());
+                }
+                ok_input.for_each(|_, data| {
+                    data.swap(&mut ok_buf);
+                    for (row, _, _) in ok_buf.drain(..) {
+                        row.iter().for_each(|a| println!("************ {:?}", a))
+                    }
+                });
+                if PartialOrder::less_equal(&up_to, &frontier) {
+                    finished = true;
+                }
+            }
+        });
+
+        Some(Rc::new(""))
     }
 }

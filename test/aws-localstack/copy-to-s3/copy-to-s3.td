@@ -16,6 +16,7 @@ ALTER SYSTEM SET enable_copy_to_expr = true;
 # Prepare table data
 > CREATE TABLE t (a int);
 > INSERT INTO t VALUES (1);
+> INSERT INTO t VALUES (2);
 
 > CREATE CONNECTION aws_conn
   TO AWS (ASSUME ROLE ARN 'assume-role', ASSUME ROLE SESSION NAME 'session-name');
