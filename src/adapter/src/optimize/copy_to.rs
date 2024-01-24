@@ -249,14 +249,12 @@ impl GlobalMirPlan<Unresolved> {
         );
 
         // Set the `as_of` timestamp for the dataflow.
-        self.df_desc.set_as_of(as_of);
+        self.df_desc.set_as_of(as_of.clone());
 
-        // The only outputs of the dataflow are sinks, so we might be able to
-        // turn off the computation early, if they all have non-trivial
-        // `up_to`s.
-        self.df_desc.until = Antichain::from_elem(Timestamp::MIN);
-        for (_, sink) in &self.df_desc.sink_exports {
-            self.df_desc.until.join_assign(&sink.up_to);
+        if let Some(until) = as_of.into_option() {
+            self.df_desc.until = Antichain::from_elem(until);
+        } else {
+            //warn!(as_of = %as_of, "as_of + 1 overflow");
         }
 
         GlobalMirPlan {

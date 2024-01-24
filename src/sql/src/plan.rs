@@ -713,7 +713,13 @@ pub struct SelectPlan {
     pub source: MirRelationExpr,
     pub when: QueryWhen,
     pub finishing: RowSetFinishing,
-    pub copy_to: Option<CopyFormat>,
+    pub copy_to: Option<CopySelectTo>,
+}
+
+#[derive(Clone, Debug)]
+pub enum CopySelectTo {
+    StdOut(CopyFormat),
+    Sink(String),
 }
 
 #[derive(Debug)]
@@ -797,7 +803,7 @@ pub struct CopyToPlan {
     pub format_params: CopyFormatParams<'static>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum CopyToTarget {
     Resolved(Uri),
     Unresolved(MirScalarExpr),

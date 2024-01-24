@@ -115,7 +115,7 @@ use mz_secrets::{SecretsController, SecretsReader};
 use mz_sql::ast::{CreateSubsourceStatement, Raw, Statement};
 use mz_sql::catalog::EnvironmentId;
 use mz_sql::names::{Aug, ResolvedIds};
-use mz_sql::plan::{self, CopyFormat, CreateConnectionPlan, Params, QueryWhen};
+use mz_sql::plan::{self, CopyFormat, CopySelectTo, CreateConnectionPlan, Params, QueryWhen};
 use mz_sql::rbac::UnauthorizedError;
 use mz_sql::session::user::{RoleMetadata, User};
 use mz_sql::session::vars::{self, ConnectionCounter, OwnedVarInput, SystemVars};
@@ -359,7 +359,7 @@ pub enum RealTimeRecencyContext {
     Peek {
         ctx: ExecuteContext,
         root_otel_ctx: OpenTelemetryContext,
-        copy_to: Option<CopyFormat>,
+        copy_to: Option<CopySelectTo>,
         when: QueryWhen,
         target_replica: Option<ReplicaId>,
         timeline_context: TimelineContext,
@@ -411,7 +411,7 @@ pub struct PeekStageValidate {
 pub struct PeekStageTimestamp {
     validity: PlanValidity,
     source: MirRelationExpr,
-    copy_to: Option<CopyFormat>,
+    copy_to: Option<CopySelectTo>,
     source_ids: BTreeSet<GlobalId>,
     when: QueryWhen,
     target_replica: Option<ReplicaId>,
@@ -424,7 +424,7 @@ pub struct PeekStageTimestamp {
 pub struct PeekStageOptimize {
     validity: PlanValidity,
     source: MirRelationExpr,
-    copy_to: Option<CopyFormat>,
+    copy_to: Option<CopySelectTo>,
     source_ids: BTreeSet<GlobalId>,
     when: QueryWhen,
     target_replica: Option<ReplicaId>,
@@ -437,7 +437,7 @@ pub struct PeekStageOptimize {
 #[derive(Debug)]
 pub struct PeekStageRealTimeRecency {
     validity: PlanValidity,
-    copy_to: Option<CopyFormat>,
+    copy_to: Option<CopySelectTo>,
     source_ids: BTreeSet<GlobalId>,
     id_bundle: CollectionIdBundle,
     when: QueryWhen,
@@ -452,7 +452,7 @@ pub struct PeekStageRealTimeRecency {
 #[derive(Debug)]
 pub struct PeekStageFinish {
     validity: PlanValidity,
-    copy_to: Option<CopyFormat>,
+    copy_to: Option<CopySelectTo>,
     id_bundle: Option<CollectionIdBundle>,
     when: QueryWhen,
     target_replica: Option<ReplicaId>,

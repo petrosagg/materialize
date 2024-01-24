@@ -44,7 +44,7 @@ use crate::plan::scope::Scope;
 use crate::plan::statement::{ddl, StatementContext, StatementDesc};
 use crate::plan::with_options::{self, TryFromValue};
 use crate::plan::{
-    self, side_effecting_func, transform_ast, CopyToFrom, CopyToPlan, CreateSinkPlan,
+    self, side_effecting_func, transform_ast, CopySelectTo, CopyToFrom, CopyToPlan, CreateSinkPlan,
     ExplainSinkSchemaPlan, ExplainTimestampPlan,
 };
 use crate::plan::{
@@ -184,7 +184,7 @@ pub fn plan_select(
     scx: &StatementContext,
     select: SelectStatement<Aug>,
     params: &Params,
-    copy_to: Option<CopyFormat>,
+    copy_to: Option<CopySelectTo>,
 ) -> Result<Plan, PlanError> {
     if let Some(f) = side_effecting_func::plan_select_if_side_effecting(scx, &select, params)? {
         return Ok(Plan::SideEffectingFunc(f));
@@ -927,9 +927,12 @@ pub fn plan_copy(
     match (&direction, &target) {
         (CopyDirection::To, CopyTarget::Stdout) => match relation {
             CopyRelation::Table { .. } => sql_bail!("table with COPY TO unsupported"),
-            CopyRelation::Select(stmt) => {
-                Ok(plan_select(scx, stmt, &Params::empty(), Some(format))?)
-            }
+            CopyRelation::Select(stmt) => Ok(plan_select(
+                scx,
+                stmt,
+                &Params::empty(),
+                Some(CopySelectTo::StdOut(format)),
+            )?),
             CopyRelation::Subscribe(stmt) => {
                 Ok(plan_subscribe(scx, stmt, &Params::empty(), Some(format))?)
             }
@@ -943,36 +946,46 @@ pub fn plan_copy(
         (CopyDirection::To, CopyTarget::Expr(to_expr)) => {
             scx.require_feature_flag(&vars::ENABLE_COPY_TO_EXPR)?;
 
-            let from = match relation {
+            // TODO(mouli): refactor and clean
+            let stmt = match relation {
                 CopyRelation::Table { name, columns } => {
                     if !columns.is_empty() {
                         // TODO(mouli): Add support for this
                         sql_bail!("specifying columns for COPY <table_name> TO commands not yet supported; use COPY (SELECT...) TO ... instead");
                     }
-                    CopyToFrom::Id {
-                        id: *name.item_id(),
-                    }
+                    // CopyToFrom::Id {
+                    //     id: *name.item_id(),
+                    // }
+                    todo!()
                 }
                 CopyRelation::Select(stmt) => {
                     if !stmt.query.order_by.is_empty() {
                         sql_bail!("ORDER BY is not supported in SELECT query for COPY statements")
                     }
-                    let PlannedRootQuery {
-                        expr,
-                        finishing,
-                        desc,
-                        scope: _,
-                    } = plan_query(scx, stmt.query, &Params::empty(), QueryLifetime::OneShot)?;
-                    CopyToFrom::Query {
-                        expr,
-                        desc,
-                        finishing,
-                    }
+                    // let PlannedRootQuery {
+                    //     expr,
+                    //     finishing,
+                    //     desc,
+                    //     scope: _,
+                    // } = plan_query(scx, stmt.query, &Params::empty(), QueryLifetime::OneShot)?;
+                    // CopyToFrom::Query {
+                    //     expr,
+                    //     desc,
+                    //     finishing,
+                    // }
+                    stmt
                 }
                 _ => sql_bail!("COPY {} {} not supported", direction, target),
             };
 
-            plan_copy_to(scx, from, to_expr, format, options)
+            Ok(plan_select(
+                scx,
+                stmt,
+                &Params::empty(),
+                Some(CopySelectTo::Sink("".to_string())),
+            )?)
+
+            //plan_copy_to(scx, from, to_expr, format, options)
         }
         _ => sql_bail!("COPY {} {} not supported", direction, target),
     }
