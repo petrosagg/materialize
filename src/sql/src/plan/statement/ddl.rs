@@ -1146,15 +1146,21 @@ pub fn plan_create_source(
             // If we are applying an encoding we need to ensure that the incoming value_desc is a
             // single column of type bytes.
             match external_connection.value_desc().typ().columns() {
-                [typ] => match typ.scalar_type {
-                    ScalarType::Bytes => {}
-                    _ => sql_bail!(
-                        "The schema produced by the source is incompatible with format decoding"
-                    ),
-                },
-                _ => sql_bail!(
-                    "The schema produced by the source is incompatible with format decoding"
-                ),
+                [ColumnType {
+                    scalar_type: ScalarType::Bytes,
+                    ..
+                }] => {}
+                _ => {
+                    let format = match format {
+                        Some(format) => format.clone(),
+                        None => sql_bail!("[internal error] encoding is some but format is none"),
+                    };
+
+                    return Err(PlanError::IncompatibleSourceEncoding {
+                        source_name: external_connection.name(),
+                        format,
+                    });
+                }
             }
 
             let (key_desc, value_desc) = encoding.desc()?;

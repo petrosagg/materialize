@@ -252,6 +252,10 @@ pub enum PlanError {
         /// created
         hypothetical_replica_count: usize,
     },
+    IncompatibleSourceEncoding {
+        source_name: &'static str,
+        format: mz_sql_parser::ast::CreateSourceFormat<crate::names::Aug>,
+    },
     // TODO(benesch): eventually all errors should be structured.
     Unstructured(String),
 }
@@ -429,6 +433,9 @@ impl PlanError {
             Self::SubsourceNameConflict { .. } | Self::SubsourceAlreadyReferredTo { .. } => {
                 Some("Specify target table names using FOR TABLES (foo AS bar), or limit the upstream tables using FOR SCHEMAS (foo)".into())
             },
+            Self::IncompatibleSourceEncoding {.. } => {
+                Some("For compatibility between connections and formats, see https://materialize.com/docs/sql/create-source/".into())
+            }
             _ => None,
         }
     }
@@ -685,6 +692,9 @@ impl fmt::Display for PlanError {
             Self::CreateReplicaFailStorageObjects {..} => {
                 write!(f, "cannot create more than one replica of a cluster containing sources or sinks")
             },
+            Self::IncompatibleSourceEncoding { source_name, format } => {
+                write!(f, "the specified {} connection is incompatible with{}", source_name, format.to_ast_string())
+            }
         }
     }
 }
