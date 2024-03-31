@@ -168,10 +168,10 @@ where
     pub fn rewrite_ts(
         &mut self,
         frontier: &Antichain<T>,
-        new_upper: Antichain<T>,
+        upper: Antichain<T>,
     ) -> Result<(), InvalidUsage<T>> {
         self.batch
-            .rewrite_ts(frontier, new_upper)
+            .rewrite_ts(frontier, upper)
             .map_err(InvalidUsage::InvalidRewrite)
     }
 
@@ -1018,8 +1018,11 @@ pub(crate) fn validate_truncate_batch<T: Timestamp>(
 
 #[cfg(test)]
 mod tests {
+    use timely::order::Product;
+
     use crate::cache::PersistClientCache;
     use crate::internal::paths::{BlobKey, PartialBlobKey};
+    use crate::read::ListenEvent;
     use crate::tests::{all_ok, new_test_client, CodecProduct};
     use crate::PersistLocation;
 
@@ -1255,6 +1258,71 @@ mod tests {
 
         let (actual, _) = read.expect_listen(0).await.read_until(&3).await;
         let expected = vec![(((Ok("foo".to_owned())), Ok(())), 2, 1)];
+        assert_eq!(actual, expected);
+    }
+
+    // NB: Most edge cases are exercised in datadriven tests.
+    #[mz_ore::test(tokio::test)]
+    #[cfg_attr(miri, ignore)] // too slow
+    async fn rewrite_ts_partial() {
+        let client = new_test_client().await;
+        let (mut write, read) = client
+            .expect_open::<String, (), Product<u32, u32>, i64>(ShardId::new())
+            .await;
+
+        // Create a batch that contains an update at (1, 4)
+        let mut batch = write.builder(Antichain::from_elem(Product::minimum()));
+        batch
+            .add(&"foo".to_owned(), &(), &Product::new(1, 4), &1)
+            .await
+            .unwrap();
+        let upper = Antichain::from_iter([Product::new(2, 1)]);
+        let batch = batch.finish(upper.clone()).await.unwrap();
+
+        let batch = batch.into_transmittable_batch();
+        let mut batch = write.batch_from_transmittable_batch(batch);
+
+        let rewrite_frontier = Antichain::from_iter([Product::new(2, 0)]);
+        batch.rewrite_ts(&rewrite_frontier, upper.clone()).unwrap();
+
+        write
+            .compare_and_append_batch(
+                &mut [&mut batch],
+                Antichain::from_elem(Product::new(0, 0)),
+                upper.clone(),
+            )
+            .await
+            .expect("invalid usage")
+            .expect("unexpected upper");
+
+        // Next seal the shard
+        write
+            .compare_and_append::<((String, ()), Product<u32, u32>, i64), _, _, _, _, _>(
+                [],
+                upper.clone(),
+                Antichain::new(),
+            )
+            .await
+            .expect("invalid usage")
+            .expect("unexpected upper");
+
+        // Read updates back
+        let mut listen = read
+            .listen(Antichain::from_elem(Product::minimum()))
+            .await
+            .expect("cannot serve requested as_of");
+        let mut actual = Vec::new();
+        let mut frontier = Antichain::from_elem(Product::minimum());
+        while !frontier.is_empty() {
+            for event in listen.fetch_next().await {
+                match event {
+                    ListenEvent::Updates(mut x) => actual.append(&mut x),
+                    ListenEvent::Progress(x) => frontier = x,
+                }
+            }
+        }
+
+        let expected = vec![(((Ok("foo".to_owned())), Ok(())), Product::new(2, 4), 1)];
         assert_eq!(actual, expected);
     }
 }
