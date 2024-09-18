@@ -302,6 +302,8 @@ pub enum TransientError {
 pub enum DefiniteError {
     #[error("slot compacted past snapshot point. snapshot consistent point={0} resume_lsn={1}")]
     SlotCompactedPastResumePoint(MzOffset, MzOffset),
+    #[error("slot compacted past snapshot point. snapshot xmin={0} slot_xmin={1}")]
+    SlotCompactedPastResumePointXid(u64, u64),
     #[error("table was truncated")]
     TableTruncated,
     #[error("table was dropped")]
@@ -334,6 +336,9 @@ impl From<DefiniteError> for DataflowError {
         DataflowError::SourceError(Box::new(SourceError {
             error: match &err {
                 DefiniteError::SlotCompactedPastResumePoint(_, _) => {
+                    SourceErrorDetails::Other(err.to_string())
+                }
+                DefiniteError::SlotCompactedPastResumePointXid(_, _) => {
                     SourceErrorDetails::Other(err.to_string())
                 }
                 DefiniteError::TableTruncated => SourceErrorDetails::Other(err.to_string()),
@@ -382,6 +387,8 @@ struct SlotMetadata {
     /// The address (LSN) up to which the logical slot's consumer has confirmed receiving data.
     /// Data corresponding to the transactions committed before this LSN is not available anymore.
     confirmed_flush_lsn: MzOffset,
+    /// The oldest transaction that this slot needs the database to retain.
+    xmin: Option<u64>,
 }
 
 /// Fetches the minimum LSN at which this slot can safely resume.
@@ -391,7 +398,7 @@ async fn fetch_slot_metadata(
     interval: Duration,
 ) -> Result<SlotMetadata, TransientError> {
     loop {
-        let query = "SELECT active_pid, confirmed_flush_lsn
+        let query = "SELECT active_pid, confirmed_flush_lsn, xmin::text::int8
                 FROM pg_replication_slots WHERE slot_name = $1";
         let Some(row) = client.query_opt(query, &[&slot]).await? else {
             return Err(TransientError::MissingReplicationSlot);
@@ -405,6 +412,7 @@ async fn fetch_slot_metadata(
                 return Ok(SlotMetadata {
                     confirmed_flush_lsn: MzOffset::from(lsn),
                     active_pid: row.get("active_pid"),
+                    xmin: row.get::<_, i64>("xmin").try_into().ok(),
                 })
             }
             // It can happen that confirmed_flush_lsn is NULL as the slot initializes

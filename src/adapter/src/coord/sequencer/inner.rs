@@ -3671,7 +3671,10 @@ impl Coordinator {
                     CreateSourceConnection::Postgres {
                         options: curr_options,
                         ..
-                    } => {
+                    } | CreateSourceConnection::Yugabyte {
+                        options: curr_options,
+                        ..
+                    }=> {
                         let mz_sql::plan::PgConfigOptionExtracted {
                             mut text_columns, ..
                         } = curr_options.clone().try_into()?;

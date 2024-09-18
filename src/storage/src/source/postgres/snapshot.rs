@@ -132,10 +132,11 @@
 //!      v          v
 //! ```
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::convert::Infallible;
 use std::pin::pin;
 use std::rc::Rc;
+use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -165,7 +166,7 @@ use tokio_postgres::types::{Oid, PgLsn};
 use tracing::{error, trace};
 
 use crate::metrics::source::postgres::PgSnapshotMetrics;
-use crate::source::postgres::replication::RewindRequest;
+use crate::source::postgres::replication::{RewindRequest, Snapshot};
 use crate::source::postgres::{
     verify_schema, DefiniteError, ReplicationError, SourceOutputInfo, TransientError,
 };
@@ -286,9 +287,9 @@ pub(crate) fn render<G: Scope<Timestamp = MzOffset>>(
                 // Attempt to export the snapshot by creating the main replication slot. If that
                 // succeeds then there is no need for creating additional temporary slots.
                 let main_slot = &connection.publication_details.slot;
-                let snapshot_info = match export_snapshot(&client, main_slot, false).await {
+                let snapshot_info = match export_slot_snapshot(&client, main_slot, false).await {
                     Ok(info) => info,
-                    Err(err @ TransientError::ReplicationSlotAlreadyExists) => {
+                    Err(TransientError::ReplicationSlotAlreadyExists) => {
                         match connection.connection.flavor {
                             // If we're connecting to a vanilla we have the option of exporting a
                             // snapshot via a temporary slot
@@ -297,10 +298,10 @@ pub(crate) fn render<G: Scope<Timestamp = MzOffset>>(
                                     "mzsnapshot_{}",
                                     uuid::Uuid::new_v4()).replace('-', ""
                                 );
-                                export_snapshot(&client, &tmp_slot, true).await?
+                                export_slot_snapshot(&client, &tmp_slot, true).await?
                             }
-                            // No salvation for Yugabyte
-                            PostgresFlavor::Yugabyte => return Err(err),
+                            // Otherwise we fallback to an XID snapshot
+                            PostgresFlavor::Yugabyte => export_xid_snapshot(&client).await?,
                         }
                     }
                     Err(err) => return Err(err),
@@ -334,7 +335,7 @@ pub(crate) fn render<G: Scope<Timestamp = MzOffset>>(
             )
             .await?;
 
-            let (snapshot, snapshot_lsn) = loop {
+            let (snapshot_id, snapshot) = loop {
                 match snapshot_input.next().await {
                     Some(AsyncEvent::Data(_, mut data)) => {
                         break data.pop().expect("snapshot sent above")
@@ -348,8 +349,8 @@ pub(crate) fn render<G: Scope<Timestamp = MzOffset>>(
             };
             // Snapshot leader is already in identified transaction but all other workers need to enter it.
             if !is_snapshot_leader {
-                trace!(%id, "timely-{worker_id} using snapshot id {snapshot:?}");
-                use_snapshot(&client, &snapshot).await?;
+                trace!(%id, "timely-{worker_id} using snapshot id {snapshot_id:?}");
+                use_snapshot(&client, &snapshot_id).await?;
             }
 
             let upstream_info = {
@@ -467,7 +468,7 @@ pub(crate) fn render<G: Scope<Timestamp = MzOffset>>(
 
                 trace!(
                     %id,
-                    "timely-{worker_id} snapshotting table {:?}({oid}) @ {snapshot_lsn}",
+                    "timely-{worker_id} snapshotting table {:?}({oid}) @ {snapshot:?}",
                     table
                 );
 
@@ -512,7 +513,10 @@ pub(crate) fn render<G: Scope<Timestamp = MzOffset>>(
             for output in reader_table_info.values() {
                 for (output_index, (desc, _)) in output {
                     trace!(%id, "timely-{worker_id} producing rewind request for table {} output {output_index}", desc.name);
-                    let req = RewindRequest { output_index: *output_index, snapshot_lsn };
+                    let req = RewindRequest {
+                        output_index: *output_index,
+                        snapshot: snapshot.clone(),
+                    };
                     rewinds_handle.give(&rewind_cap_set[0], req);
                 }
             }
@@ -599,12 +603,12 @@ pub(crate) fn render<G: Scope<Timestamp = MzOffset>>(
 /// Starts a read-only transaction on the SQL session of `client` at a consistent LSN point by
 /// creating a replication slot. Returns a snapshot identifier that can be imported in
 /// other SQL session and the LSN of the consistent point.
-async fn export_snapshot(
+async fn export_slot_snapshot(
     client: &Client,
     slot: &str,
     temporary: bool,
-) -> Result<(String, MzOffset), TransientError> {
-    match export_snapshot_inner(client, slot, temporary).await {
+) -> Result<(String, Snapshot), TransientError> {
+    match export_slot_snapshot_inner(client, slot, temporary).await {
         Ok(ok) => Ok(ok),
         Err(err) => {
             // We don't want to leave the client inside a failed tx
@@ -614,11 +618,11 @@ async fn export_snapshot(
     }
 }
 
-async fn export_snapshot_inner(
+async fn export_slot_snapshot_inner(
     client: &Client,
     slot: &str,
     temporary: bool,
-) -> Result<(String, MzOffset), TransientError> {
+) -> Result<(String, Snapshot), TransientError> {
     client
         .simple_query("BEGIN READ ONLY ISOLATION LEVEL REPEATABLE READ;")
         .await?;
@@ -651,7 +655,52 @@ async fn export_snapshot_inner(
         .unwrap();
     let snapshot = row.get("pg_export_snapshot").unwrap().to_owned();
 
-    Ok((snapshot, MzOffset::from(consistent_point)))
+    Ok((snapshot, Snapshot::Lsn(MzOffset::from(consistent_point))))
+}
+
+/// Starts a read-only transaction on the SQL session of `client` and returns the transaction
+/// snapshot in the form of an XID set. Returns a snapshot identifier that can be imported in
+/// other SQL session and the LSN of the consistent point.
+async fn export_xid_snapshot(client: &Client) -> Result<(String, Snapshot), TransientError> {
+    match export_xid_snapshot_inner(client).await {
+        Ok(ok) => Ok(ok),
+        Err(err) => {
+            // We don't want to leave the client inside a failed tx
+            client.simple_query("ROLLBACK;").await?;
+            Err(err)
+        }
+    }
+}
+
+async fn export_xid_snapshot_inner(client: &Client) -> Result<(String, Snapshot), TransientError> {
+    client
+        .simple_query("BEGIN READ ONLY ISOLATION LEVEL REPEATABLE READ;")
+        .await?;
+
+    let row = simple_query_opt(client, "SELECT txid_current_snapshot();")
+        .await?
+        .unwrap();
+
+    let mut parts = dbg!(row.get("txid_current_snapshot").unwrap()).split(':');
+    let snapshot = Snapshot::Xid {
+        xmin: parts.next().unwrap().parse().unwrap(),
+        xmax: parts.next().unwrap().parse().unwrap(),
+        in_progress: BTreeSet::from_iter(
+            dbg!(parts
+                .next()
+                .unwrap())
+                .split(',')
+                .filter(|xid| !xid.is_empty())
+                .map(|xid| u64::from_str(dbg!(xid)).unwrap()),
+        ),
+    };
+
+    let row = simple_query_opt(client, "SELECT pg_export_snapshot();")
+        .await?
+        .unwrap();
+    let snapshot_id = row.get("pg_export_snapshot").unwrap().to_owned();
+
+    Ok((snapshot_id, snapshot))
 }
 
 /// Starts a read-only transaction on the SQL session of `client` at a the consistent LSN point of

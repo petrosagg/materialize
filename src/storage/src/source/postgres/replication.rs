@@ -69,7 +69,8 @@
 //! [1]: https://www.postgresql.org/docs/15/protocol-replication.html#PROTOCOL-REPLICATION-START-REPLICATION
 //! [2]: https://www.postgresql.org/message-id/CAFPTHDZS9O9WG02EfayBd6oONzK%2BqfUxS6AbVLJ7W%2BKECza2gg%40mail.gmail.com
 
-use std::collections::BTreeMap;
+use std::collections::btree_map::Entry;
+use std::collections::{BTreeMap, BTreeSet};
 use std::convert::Infallible;
 use std::pin::pin;
 use std::rc::Rc;
@@ -131,8 +132,56 @@ static PG_EPOCH: LazyLock<SystemTime> =
 pub(crate) struct RewindRequest {
     /// The output index that should be rewound.
     pub(crate) output_index: usize,
-    /// The LSN that the snapshot was taken at.
-    pub(crate) snapshot_lsn: MzOffset,
+    /// A description of the point the snapshot was taken at.
+    pub(crate) snapshot: Snapshot,
+}
+
+/// A transaction snapshot identified either by its LSN or its open transaction set
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) enum Snapshot {
+    /// A snapshot identified by an LSN. A transaction is contained in the snapshot if its commit
+    /// LSN is less than or equal to the snapshot LSN.
+    Lsn(MzOffset),
+    /// A snapshot identified by an open transaction set. A transaction is contained in the
+    /// snapshot if its id is less than `xmax` an not `in_progress`.
+    Xid {
+        /// Lowest transaction ID that was still active. All transaction IDs less than xmin are
+        /// either committed and visible, or rolled back and dead.
+        xmin: u64,
+        /// One past the highest completed transaction ID. All transaction IDs greater than or
+        /// equal to xmax had not yet completed as of the time of the snapshot, and thus are
+        /// invisible.
+        xmax: u64,
+        /// Transactions in progress at the time of the snapshot. A transaction ID that is less
+        /// than xmax and not in this set was already completed at the time of the snapshot, and
+        /// thus is either visible or dead according to its commit status.
+        in_progress: BTreeSet<u64>,
+    },
+}
+
+impl Snapshot {
+    /// Checks whether a transaction with id `xid` and commit lsn `commit_lsn` was visible in this
+    /// snapshot.
+    fn is_visible_tx(&self, xid: &u64, commit_lsn: &MzOffset) -> bool {
+        match self {
+            Snapshot::Lsn(snapshot_lsn) => commit_lsn <= snapshot_lsn,
+            Snapshot::Xid {
+                xmin,
+                xmax,
+                in_progress,
+            } => {
+                // See also the corresponding pg function:
+                // https://github.com/postgres/postgres/blob/REL_16_4/src/backend/utils/adt/xid8funcs.c#L226
+                if xid < xmin {
+                    true
+                } else if !(xid < xmax) {
+                    false
+                } else {
+                    !in_progress.contains(xid)
+                }
+            }
+        }
+    }
 }
 
 /// Renders the replication dataflow. See the module documentation for more information.
@@ -312,11 +361,35 @@ pub(crate) fn render<G: Scope<Timestamp = MzOffset>>(
             while let Some(event) = rewind_input.next().await {
                 if let AsyncEvent::Data(cap, data) = event {
                     for req in data {
-                        if resume_lsn > req.snapshot_lsn + 1 {
-                            let err = DefiniteError::SlotCompactedPastResumePoint(
-                                req.snapshot_lsn + 1,
-                                resume_lsn,
-                            );
+                        let result = match req.snapshot {
+                            Snapshot::Lsn(snapshot_lsn) => {
+                                if resume_lsn > snapshot_lsn + 1 {
+                                    Err(DefiniteError::SlotCompactedPastResumePoint(
+                                        snapshot_lsn + 1,
+                                        resume_lsn,
+                                    ))
+                                } else {
+                                    Ok(())
+                                }
+                            }
+                            Snapshot::Xid {
+                                xmin: snapshot_xmin,
+                                ..
+                            } => {
+                                let resume_xmin = slot_metadata.xmin.unwrap_or(0);
+                                // XXX: figure out if this needs to be equal or not
+                                if resume_xmin > snapshot_xmin {
+                                    Err(DefiniteError::SlotCompactedPastResumePointXid(
+                                        snapshot_xmin,
+                                        resume_xmin,
+                                    ))
+                                } else {
+                                    Ok(())
+                                }
+                            }
+                        };
+
+                        if let Err(err) = result {
                             // If the replication stream cannot be obtained from the resume point there is nothing
                             // else to do. These errors are not retractable.
                             for (oid, outputs) in table_info.iter() {
@@ -341,7 +414,7 @@ pub(crate) fn render<G: Scope<Timestamp = MzOffset>>(
                             );
                             return Ok(());
                         }
-                        rewinds.insert(req.output_index, (cap.clone(), req));
+                        rewinds.insert(req.output_index, (cap.clone(), req.snapshot));
                     }
                 }
             }
@@ -397,6 +470,7 @@ pub(crate) fn render<G: Scope<Timestamp = MzOffset>>(
             // creating excessive progress tracking traffic when there are multiple small
             // transactions ready to go.
             let mut data_upper = *data_cap_set[0].time();
+            let mut max_xid_consumed = 0;
             // A stash of reusable vectors to convert from bytes::Bytes based data, which is not
             // compatible with `columnation`, to Vec<u8> data that is.
             let mut col_temp: Vec<Vec<u8>> = vec![];
@@ -408,6 +482,7 @@ pub(crate) fn render<G: Scope<Timestamp = MzOffset>>(
                     Ok(XLogData(data)) => match data.data() {
                         Begin(begin) => {
                             let commit_lsn = MzOffset::from(begin.final_lsn());
+                            let xid = u64::from(begin.xid());
 
                             let mut tx = pin!(extract_transaction(
                                 stream.by_ref(),
@@ -422,14 +497,14 @@ pub(crate) fn render<G: Scope<Timestamp = MzOffset>>(
 
                             trace!(
                                 %id,
-                                "timely-{worker_id} extracting transaction \
-                                    at {commit_lsn}"
+                                "timely-{worker_id} extracting xid {xid} at {commit_lsn}"
                             );
                             assert!(
                                 data_upper <= commit_lsn,
                                 "new_upper={data_upper} tx_lsn={commit_lsn}",
                             );
                             data_upper = commit_lsn + 1;
+                            max_xid_consumed = std::cmp::max(max_xid_consumed, xid);
                             // We are about to ingest a transaction which has the possiblity to be
                             // very big and we certainly don't want to hold the data in memory. For
                             // this reason we eagerly downgrade the upper capability in order for
@@ -457,8 +532,9 @@ pub(crate) fn render<G: Scope<Timestamp = MzOffset>>(
                                     Err(err) => Err(err.into()),
                                 };
                                 let mut data = (oid, output_index, event);
-                                if let Some((data_cap, req)) = rewinds.get(&output_index) {
-                                    if commit_lsn <= req.snapshot_lsn {
+                                if let Some((data_cap, snapshot)) = rewinds.get(&output_index) {
+                                    if snapshot.is_visible_tx(&xid, &commit_lsn) {
+                                        trace!(%id, "timely-{worker_id} rewinding xid {xid} at {commit_lsn}");
                                         let update = (data, MzOffset::from(0), -diff);
                                         data_output.give_fueled(data_cap, &update).await;
                                         data = update.0;
@@ -497,7 +573,10 @@ pub(crate) fn render<G: Scope<Timestamp = MzOffset>>(
                         "timely-{worker_id} yielding at lsn={}",
                         data_upper
                     );
-                    rewinds.retain(|_, (_, req)| data_cap_set[0].time() <= &req.snapshot_lsn);
+                    rewinds.retain(|_, (_, snapshot)| match snapshot {
+                        Snapshot::Lsn(snapshot_lsn) => data_cap_set[0].time() <= snapshot_lsn,
+                        Snapshot::Xid { xmax, .. } => max_xid_consumed < *xmax
+                    })
                 }
             }
             // We never expect the replication stream to gracefully end
