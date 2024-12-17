@@ -297,7 +297,6 @@ pub(crate) fn render<G>(
     desired_collection: Collection<G, Result<Row, DataflowError>, Diff>,
     storage_state: &StorageState,
     metrics: SourcePersistSinkMetrics,
-    output_index: usize,
     busy_signal: Arc<Semaphore>,
 ) -> (
     Stream<G, ()>,
@@ -341,7 +340,6 @@ where
         &written_batches,
         persist_clients,
         storage_state,
-        output_index,
         metrics,
         Arc::clone(&busy_signal),
     );
@@ -898,7 +896,6 @@ fn append_batches<G>(
     batches: &Stream<G, HollowBatchAndMetadata<mz_repr::Timestamp>>,
     persist_clients: Arc<PersistClientCache>,
     storage_state: &StorageState,
-    output_index: usize,
     metrics: SourcePersistSinkMetrics,
     busy_signal: Arc<Semaphore>,
 ) -> (
@@ -1033,11 +1030,8 @@ where
         // if the failpoint is configured
         let mut pg_snapshot_pause = false;
         (|| {
-            fail::fail_point!("pg_snapshot_pause", |val| {
-                pg_snapshot_pause = val.map_or(false, |index| {
-                    let index: usize = index.parse().unwrap();
-                    index == output_index
-                });
+            fail::fail_point!("pg_snapshot_pause", |_| {
+                pg_snapshot_pause = true;
             });
         })();
 
