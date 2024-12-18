@@ -159,22 +159,6 @@ impl AddAssign<&BatchMetrics> for BatchMetrics {
     }
 }
 
-impl BatchMetrics {
-    fn is_empty(&self) -> bool {
-        let BatchMetrics {
-            inserts: self_inserts,
-            retractions: self_retractions,
-            error_inserts: self_error_inserts,
-            error_retractions: self_error_retractions,
-        } = self;
-
-        *self_inserts == 0
-            && *self_retractions == 0
-            && *self_error_inserts == 0
-            && *self_error_retractions == 0
-    }
-}
-
 /// Manages batches and metrics.
 struct BatchBuilderAndMetadata<K, V, T, D>
 where

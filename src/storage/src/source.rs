@@ -40,6 +40,7 @@ pub use kafka::KafkaSourceReader;
 pub use source_reader_pipeline::{
     create_raw_source, RawSourceCreationConfig, SourceExportCreationConfig,
 };
+use mz_ore::cast::CastFrom;
 use timely::container::{PushInto, SizableContainer};
 use timely::dataflow::channels::pact::Pipeline;
 use timely::dataflow::operators::generic::builder_rc::OperatorBuilder;
@@ -78,8 +79,8 @@ impl<G: Scope, C: Container> PartitionCore<G, C> for StreamCore<G, C> {
         let mut builder = OperatorBuilder::new("Partition".to_owned(), self.scope());
 
         let mut input = builder.new_input(self, Pipeline);
-        let mut outputs = Vec::with_capacity(parts as usize);
-        let mut streams = Vec::with_capacity(parts as usize);
+        let mut outputs = Vec::with_capacity(usize::cast_from(parts));
+        let mut streams = Vec::with_capacity(usize::cast_from(parts));
 
         for _ in 0..parts {
             let (output, stream) = builder.new_output();
